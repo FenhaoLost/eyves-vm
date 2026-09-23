@@ -1,0 +1,115 @@
+# Eyves VM 配置示例。
+# 所有配置均可被环境变量覆盖，前缀 EYVES_，层级用下划线连接，例如：
+#   EYVES_PANEL_LISTEN=0.0.0.0:8443
+#   EYVES_AGENT_ENDPOINT=https://10.0.0.5:8788
+# 禁止在代码中硬编码 IP、端口、超时、密钥、路径（见《全局编码规范·配置》）。
+
+panel:
+  # 主控监听地址。默认只监听回环，暴露公网必须显式配置。
+  listen: "127.0.0.1:8443"
+  # 会话 Cookie 是否强制 Secure（生产必须 true；本地 http 调试可 false）。
+  secure_cookies: true
+  # 是否信任 X-Forwarded-For/Proto（仅当位于受信反向代理之后才置 true）。
+  trust_proxy: false
+  # 是否开放自助注册。
+  allow_signup: false
+  site_name: "Eyves VM"
+  # TLS：面板自身终止 TLS 时填写；由反向代理终止则留空。
+  tls:
+    cert_file: ""
+    key_file: ""
+
+database:
+  # 单机默认 SQLite；集群扩展预留 postgres。
+  driver: "sqlite"            # sqlite | postgres | mysql
+  dsn: "/var/lib/eyves/eyves.db"
+  # PostgreSQL 预留（driver=postgres 时生效）：
+  # dsn: "postgres://eyves:__SET_ME__@127.0.0.1:5432/eyves?sslmode=require"
+  max_open_conns: 8
+  max_idle_conns: 4
+  busy_timeout_ms: 10000
+
+cluster:
+  # 节点心跳与健康检查。
+  probe_interval: 2m
+  probe_timeout: 12s
+  # 判定节点离线前允许的连续失败次数。
+  unhealthy_threshold: 3
+  # 跨节点迁移的并发上限与单次超时。
+  max_concurrent_migrations: 2
+  migration_timeout: 20m
+
+billing:
+  # 默认币种与金额上限（最小单位：分）。
+  currency: "CNY"
+  max_amount_minor: 10000000000      # 1e10 分 = 1 亿元
+  # 订单超时未支付自动置 expired。
+  order_ttl: 30m
+  # 购买失败自动退款开关（关闭会导致资金滞留，仅调试用）。
+  auto_refund_on_provision_failure: true
+  # 退款窗口：服务期结束后仍可退的天数。
+  refund_window_days: 7
+  # 续费/到期扫描周期。
+  renewal_scan_interval: 5m
+  # 到期宽限：到期后多久停机（0 = 立即停机）。
+  grace_period: 24h
+  # 是否允许按量计费（按小时结算余额）。
+  usage_based: false
+
+network:
+  # IPv6 子网分配与反向 DNS。
+  ipv6:
+    enabled: true
+    # 每实例分配的 /128 由其所属 /64 派生；此处仅给出分配策略上限。
+    max_subnets_per_node: 4096
+  rdns:
+    enabled: false
+    # 反向 DNS 权威服务商（预留 rfc2136 / cloudflare）。
+    provider: ""                   # rfc2136 | cloudflare
+    server: ""                     # rfc2136 目标
+    tsig_key_name: ""
+    tsig_secret: ""                # 必须通过 EYVES_NETWORK_RDNS_TSIG_SECRET 注入
+    ttl: 300
+
+hypervisor:
+  # 默认后端；节点级可在 nodes.hypervisor 覆盖。
+  default: "incus"                 # incus | kvm | openvz
+  incus:
+    # 被控端仅与本机 Incus Unix Socket 通信，该路径为默认值。
+    socket: "/var/lib/incus/unix.socket"
+    storage_pool: "default"
+  kvm:
+    # 直连 libvirt（预留）。
+    uri: "qemu:///system"
+    default_bridge: "br0"
+  openvz:
+    enabled: false                 # 预留，未实现
+    vzctl_path: ""
+
+agent:
+  # 主控 → 被控的通信（HTTPS + HMAC，协议保持不变）。
+  scheme: "https"
+  default_port: 8788
+  sign_skew: 90s                   # 与 shared.MaxClockSkew 对齐
+  request_timeout: 30s
+  # 被控自签证书指纹钉扎；为空表示不校验（仅限开发）。
+  pinned_cert_fingerprint: ""
+  # HMAC 共享密钥必须逐节点配置在数据库 nodes.secret，禁止写入本文件。
+
+log:
+  level: "info"                    # debug | info | warn | error
+  format: "json"                   # json | text
+  # 日志禁止输出密码、token、密钥；trace_id 由中间件注入。
+  include_trace_id: true
+
+payment:
+  # epay 兼容网关（支付宝/微信）。
+  epay:
+    url: ""
+    pid: ""
+    key: ""                        # 必须通过 EYVES_PAYMENT_EPAY_KEY 注入
+  usdt:
+    enabled: false
+    address: ""
+    network: "TRC20"
+    rate_cents_per_usdt: 0         # 每 1 USDT 折合人民币（分）

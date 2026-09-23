@@ -1,0 +1,983 @@
+openapi: 3.0.3
+info:
+  title: Eyves VM Panel API
+  version: "2.0.0"
+  description: |
+    Eyves VM 主控面板 API。
+
+    兼容策略：
+      - 所有新接口位于 `/v2/` 前缀下。
+      - 旧接口（`/app/*`、`/api/*`、`/api/v1/*`、`/admin/*`）原样保留，不做任何
+        路径、请求体或响应体变更，直至明确的下线窗口。
+      - 错误统一采用结构化信封，`code` 为稳定的 `EYVES-XXX`。
+
+    认证：
+      - `sessionCookie`：浏览器会话（旧前端与 /v2 的 UI 调用）。
+      - `apiKey`：`Authorization: Bearer <key>`，服务端到服务端（计费系统、WHMCS）。
+servers:
+  - url: https://{host}/v2
+    variables:
+      host:
+        default: panel.example.com
+tags:
+  - name: instances
+  - name: snapshots
+  - name: backups
+  - name: networks
+  - name: billing
+  - name: nodes
+
+security:
+  - sessionCookie: []
+  - apiKey: []
+
+paths:
+  /instances:
+    get:
+      tags: [instances]
+      summary: 列出实例
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: node_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/InstanceStatus' }
+      responses:
+        '200':
+          description: 实例分页列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Instance' }
+                  total: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [instances]
+      summary: 创建实例（下单 + 扣款 + 下发）
+      description: |
+        等价于旧 `POST /app/deploy`。扣款成功后下发失败会**自动全额退款**并返回
+        `EYVES-401`。请求可携带 `ref` 作为幂等键，重复请求返回既有订单。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateInstanceRequest' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Instance' }
+        '402': { $ref: '#/components/responses/InsufficientBalance' }
+        '409': { $ref: '#/components/responses/DuplicateRef' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /instances/{id}:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+    get:
+      tags: [instances]
+      summary: 实例详情
+      responses:
+        '200':
+          description: 实例
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Instance' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [instances]
+      summary: 删除实例
+      parameters:
+        - name: keep_data
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /instances/{id}/actions:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+    post:
+      tags: [instances]
+      summary: 电源操作（start / stop / restart）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [start, stop, restart]
+                force: { type: boolean, default: false }
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '409': { $ref: '#/components/responses/StateConflict' }
+
+  /instances/{id}/reinstall:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+    post:
+      tags: [instances]
+      summary: 重装系统
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, example: debian/13 }
+                root_password: { type: string, format: password }
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+
+  /instances/{id}/rescue:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+    post:
+      tags: [instances]
+      summary: 进入救援模式（挂载救援 ISO，仅 KVM）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                iso: { type: string }
+                duration_minutes: { type: integer, default: 60, maximum: 1440 }
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [instances]
+      summary: 退出救援模式
+      responses:
+        '204': { description: 已退出 }
+
+  /instances/{id}/snapshots:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+    get:
+      tags: [snapshots]
+      summary: 列出快照
+      responses:
+        '200':
+          description: 快照列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Snapshot' }
+    post:
+      tags: [snapshots]
+      summary: 创建快照
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  pattern: '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Snapshot' }
+        '409': { $ref: '#/components/responses/StateConflict' }
+
+  /instances/{id}/snapshots/{name}:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [snapshots]
+      summary: 删除快照
+      responses:
+        '204': { description: 已删除 }
+
+  /instances/{id}/snapshots/{name}/restore:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [snapshots]
+      summary: 从快照还原
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+
+  /instances/{id}/backups:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+    get:
+      tags: [backups]
+      summary: 列出备份
+      responses:
+        '200':
+          description: 备份列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Backup' }
+    post:
+      tags: [backups]
+      summary: 创建备份
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 200 }
+                compress: { type: boolean, default: true }
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+
+  /instances/{id}/backups/schedules:
+    parameters:
+      - $ref: '#/components/parameters/InstanceId'
+    get:
+      tags: [backups]
+      summary: 列出定时备份任务
+      responses:
+        '200':
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/BackupSchedule' }
+    post:
+      tags: [backups]
+      summary: 创建定时备份任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BackupSchedule' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BackupSchedule' }
+
+  /networks/ipv6/subnets:
+    get:
+      tags: [networks]
+      summary: 列出已分配的 IPv6 子网
+      parameters:
+        - name: node_id
+          in: query
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: 子网列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/IPv6Subnet' }
+    post:
+      tags: [networks]
+      summary: 从节点池分配一个 IPv6 子网
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_id, prefix_length]
+              properties:
+                node_id: { type: integer, format: int64 }
+                prefix_length: { type: integer, enum: [64, 112, 120] }
+                instance_id: { type: integer, format: int64 }
+                ref: { type: string, description: 幂等键 }
+      responses:
+        '201':
+          description: 已分配
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IPv6Subnet' }
+        '409': { $ref: '#/components/responses/StateConflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /networks/ipv6/subnets/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    delete:
+      tags: [networks]
+      summary: 释放 IPv6 子网
+      responses:
+        '204': { description: 已释放 }
+        '409': { $ref: '#/components/responses/StateConflict' }
+
+  /networks/rdns:
+    get:
+      tags: [networks]
+      summary: 查询反向 DNS（PTR）记录
+      parameters:
+        - name: address
+          in: query
+          required: true
+          schema: { type: string, example: "2001:db8::1" }
+      responses:
+        '200':
+          description: PTR 记录
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PTRRecord' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [networks]
+      summary: 设置反向 DNS（PTR）记录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PTRRecord' }
+      responses:
+        '200':
+          description: 已设置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PTRRecord' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      tags: [networks]
+      summary: 删除反向 DNS 记录
+      parameters:
+        - name: address
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: 已删除 }
+
+  /billing/plans:
+    get:
+      tags: [billing]
+      summary: 列出可用套餐（含定价）
+      parameters:
+        - name: currency
+          in: query
+          schema: { type: string, default: CNY }
+        - name: purchasable_only
+          in: query
+          schema: { type: boolean, default: true }
+      responses:
+        '200':
+          description: 套餐列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Plan' }
+
+  /billing/accounts/{userId}/balance:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [billing]
+      summary: 查询账户余额
+      responses:
+        '200':
+          description: 余额
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Balance' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /billing/accounts/{userId}/transactions:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [billing]
+      summary: 查询账户流水
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 流水分页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+                  total: { type: integer }
+
+  /billing/recharges:
+    post:
+      tags: [billing]
+      summary: 充值入账（服务端到服务端，幂等）
+      description: |
+        兼容旧 `POST /api/v1/recharge` 的语义与幂等键 `ref`；
+        响应体保持 `{"ok":true,"user_id":..,"balance_cents":..,"duplicated":bool}`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount_cents, ref]
+              properties:
+                email: { type: string, format: email }
+                user_id: { type: integer, format: int64 }
+                amount_cents: { type: integer, format: int64, minimum: 1 }
+                ref: { type: string, maxLength: 64, description: 幂等键 }
+                note: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: 入账成功（重复 ref 返回 duplicated=true 且不重复入账）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RechargeResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/DuplicateRef' }
+
+  /billing/orders:
+    get:
+      tags: [billing]
+      summary: 查询订单
+      parameters:
+        - name: user_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/OrderKind' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/OrderStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 订单分页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  total: { type: integer }
+
+  /billing/orders/{orderNo}:
+    parameters:
+      - name: orderNo
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [billing]
+      summary: 查询订单详情
+      responses:
+        '200':
+          description: 订单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /billing/orders/{orderNo}/renew:
+    parameters:
+      - name: orderNo
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [billing]
+      summary: 续费（按天延长到期时间并从余额扣款）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [days]
+              properties:
+                days: { type: integer, minimum: 1, maximum: 1095 }
+                ref: { type: string, description: 幂等键 }
+      responses:
+        '200':
+          description: 续费成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '402': { $ref: '#/components/responses/InsufficientBalance' }
+
+  /billing/orders/{orderNo}/refund:
+    parameters:
+      - name: orderNo
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [billing]
+      summary: 退款（支持部分退款）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount_cents]
+              properties:
+                amount_cents: { type: integer, format: int64, minimum: 1 }
+                reason: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: 退款后订单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '409':
+          description: 订单不可退款（EYVES-303 / EYVES-304）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /nodes:
+    get:
+      tags: [nodes]
+      summary: 列出节点
+      responses:
+        '200':
+          description: 节点列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Node' }
+    post:
+      tags: [nodes]
+      summary: 添加节点
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Node' }
+      responses:
+        '201':
+          description: 已添加
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+
+  /nodes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    delete:
+      tags: [nodes]
+      summary: 移除节点
+      responses:
+        '204': { description: 已移除 }
+        '409':
+          description: 节点仍有实例（EYVES-402）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /nodes/{id}/health:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      summary: 节点健康检查（转发被控 /v1/health）
+      responses:
+        '200':
+          description: 健康报告
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NodeHealth' }
+
+  /nodes/{id}/maintenance:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    put:
+      tags: [nodes]
+      summary: 切换维护模式（维护模式下不参与新建调度）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                reason: { type: string, maxLength: 200 }
+      responses:
+        '200': { description: 已更新 }
+
+  /nodes/{id}/migrations:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      summary: 发起跨节点迁移
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instance_ids, target_node_id]
+              properties:
+                instance_ids:
+                  type: array
+                  items: { type: integer, format: int64 }
+                target_node_id: { type: integer, format: int64 }
+                live: { type: boolean, default: false, description: 在线迁移（KVM 支持）}
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '409': { $ref: '#/components/responses/StateConflict' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: cub_session
+    apiKey:
+      type: http
+      scheme: bearer
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    InstanceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    NodeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+
+  responses:
+    BadRequest:
+      description: 参数错误（EYVES-101 / EYVES-402）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: 未认证（EYVES-203）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: 无权限或功能未开通（EYVES-302）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: 资源不存在（EYVES-203 / EYVES-301）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    StateConflict:
+      description: 状态冲突（EYVES-302 / EYVES-303）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InsufficientBalance:
+      description: 余额不足（EYVES-201）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DuplicateRef:
+      description: 幂等键重复（EYVES-202），重放请求返回既有资源
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: 语义无法处理（EYVES-102 / EYVES-103 / EYVES-304）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: 稳定错误码
+          example: EYVES-201
+        message: { type: string, example: insufficient balance }
+        trace_id: { type: string, description: 便于日志关联 }
+        details:
+          type: object
+          additionalProperties: true
+
+    Money:
+      type: object
+      required: [amount_cents, currency]
+      properties:
+        amount_cents: { type: integer, format: int64, example: 1250 }
+        currency: { type: string, enum: [CNY, USD], example: CNY }
+
+    OrdersMoney:
+      type: object
+      properties:
+        amount: { $ref: '#/components/schemas/Money' }
+        refunded: { $ref: '#/components/schemas/Money' }
+
+    InstanceStatus:
+      type: string
+      enum: [provisioning, running, stopped, suspended, expired, overquota, error]
+
+    Instance:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        label: { type: string }
+        user_id: { type: integer, format: int64 }
+        node_id: { type: integer, format: int64 }
+        plan_id: { type: integer, format: int64 }
+        hypervisor: { type: string, enum: [incus, kvm, openvz] }
+        instance_type: { type: string, enum: [container, vm] }
+        image: { type: string }
+        cpu: { type: integer }
+        memory_mb: { type: integer }
+        disk_gb: { type: integer }
+        status: { $ref: '#/components/schemas/InstanceStatus' }
+        ipv4: { type: string, nullable: true }
+        ipv6: { type: string, nullable: true }
+        expires_at: { type: integer, format: int64 }
+        created_at: { type: integer, format: int64 }
+
+    CreateInstanceRequest:
+      type: object
+      required: [plan_id]
+      properties:
+        plan_id: { type: integer, format: int64 }
+        image: { type: string }
+        label: { type: string, maxLength: 32 }
+        days: { type: integer, minimum: 1, default: 30 }
+        ref: { type: string, description: 幂等键（上游账单号）}
+        node_id: { type: integer, format: int64, description: 0 表示自动调度 }
+
+    Operation:
+      type: object
+      properties:
+        operation_id: { type: string }
+        status: { type: string, enum: [queued, running, done, failed] }
+        error: { $ref: '#/components/schemas/Error' }
+
+    Snapshot:
+      type: object
+      properties:
+        name: { type: string }
+        created_at: { type: integer, format: int64 }
+        size_bytes: { type: integer, format: int64 }
+
+    Backup:
+      type: object
+      properties:
+        name: { type: string }
+        created_at: { type: integer, format: int64 }
+        size_bytes: { type: integer, format: int64 }
+        note: { type: string }
+
+    BackupSchedule:
+      type: object
+      required: [cron, keep]
+      properties:
+        id: { type: integer, format: int64 }
+        cron: { type: string, description: 五段 cron 表达式, example: "0 3 * * *" }
+        keep: { type: integer, minimum: 1, maximum: 60 }
+        enabled: { type: boolean, default: true }
+
+    IPv6Subnet:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        node_id: { type: integer, format: int64 }
+        instance_id: { type: integer, format: int64 }
+        cidr: { type: string, example: "2001:db8:1:2::/64" }
+        gateway: { type: string, example: "2001:db8:1:2::1" }
+        allocated_at: { type: integer, format: int64 }
+
+    PTRRecord:
+      type: object
+      required: [address, hostname]
+      properties:
+        address: { type: string, example: "2001:db8::1" }
+        hostname: { type: string, example: "vm-1234.example.com" }
+        ttl: { type: integer, default: 300 }
+
+    Plan:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        cpu: { type: integer }
+        memory_mb: { type: integer }
+        disk_gb: { type: integer }
+        price: { $ref: '#/components/schemas/Money' }
+        duration_days: { type: integer }
+        instance_type: { type: string, enum: [container, vm] }
+        purchasable: { type: boolean, description: "price.amount_cents > 0" }
+
+    Balance:
+      type: object
+      properties:
+        user_id: { type: integer, format: int64 }
+        email: { type: string }
+        balance: { $ref: '#/components/schemas/Money' }
+
+    Transaction:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        amount: { $ref: '#/components/schemas/Money' }
+        balance_after: { $ref: '#/components/schemas/Money' }
+        kind: { $ref: '#/components/schemas/OrderKind' }
+        ref: { type: string }
+        note: { type: string }
+        created_at: { type: integer, format: int64 }
+
+    OrderKind:
+      type: string
+      enum: [recharge, purchase, renew, upgrade, refund]
+
+    OrderStatus:
+      type: string
+      enum: [pending, paid, provisioned, active, failed, cancelled, expired,
+             refunding, refunded, partially_refunded]
+
+    Order:
+      type: object
+      properties:
+        order_no: { type: string }
+        user_id: { type: integer, format: int64 }
+        kind: { $ref: '#/components/schemas/OrderKind' }
+        plan_id: { type: integer, format: int64 }
+        instance_id: { type: integer, format: int64 }
+        money: { $ref: '#/components/schemas/OrdersMoney' }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        ref: { type: string }
+        refundable_until: { type: integer, format: int64 }
+        created_at: { type: integer, format: int64 }
+        paid_at: { type: integer, format: int64 }
+
+    RechargeResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        user_id: { type: integer, format: int64 }
+        balance_cents: { type: integer, format: int64 }
+        duplicated: { type: boolean, description: 幂等重放时为 true }
+
+    Node:
+      type: object
+      required: [name, endpoint]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        region: { type: string }
+        endpoint: { type: string, description: "https://host:port，不得硬编码在代码中" }
+        domain: { type: string }
+        hypervisor: { type: string, enum: [incus, kvm, openvz] }
+        storage_pool: { type: string }
+        maintenance: { type: boolean }
+        enabled: { type: boolean }
+        max_instances: { type: integer }
+        last_seen_at: { type: integer, format: int64 }
+        last_status: { type: string }
+
+    NodeHealth:
+      type: object
+      properties:
+        agent: { type: string }
+        kvm_ready: { type: boolean }
+        hypervisor_version: { type: string }
+        kernel: { type: string }
+        cpu_count: { type: integer }
+        mem_total: { type: integer, format: int64 }
+        mem_free: { type: integer, format: int64 }
+        load1: { type: number, format: double }
+        instances: { type: integer }
+        bridges:
+          type: object
+          additionalProperties: { type: string }
+        pools:
+          type: array
+          items: { type: string }
+        warning: { type: string }
