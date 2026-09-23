@@ -1,0 +1,33 @@
+# 构建产物
+/bin/
+*.exe
+
+# 数据库与运行时数据（绝不入库）
+*.db
+*.db-wal
+*.db-shm
+*.pre-*.bak
+/data/
+
+# 密钥与证书
+*.env
+*.pem
+*.key
+agent-cert.pem*
+tsig-secret*
+
+# 本地配置（示例文件 config.example.yaml 需要入库）
+config.yaml
+config.local.yaml
+
+# 测试与覆盖率产物
+*.out
+coverage.*
+/tmp/
+
+# 编辑器与系统噪音
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
