@@ -1,6 +1,6 @@
 # 第三部分：API 文档
 
-> 机器可读规范：[`api/openapi.yaml`](../api/openapi.yaml)（OpenAPI 3.0.3，26 路径 / 36 操作 / 21 schema）
+> 机器可读规范：[`api/openapi.yaml`](../api/openapi.yaml)（OpenAPI 3.0.3，31 路径 / 43 操作 / 36 schema）
 > 本文是人读版：解释约定、给示例、标注坑点。
 >
 > **实现状态警告**：本规范是**设计定稿**，`/v2/` 路由与 handler **尚未实现**。下面所有 cURL 示例描述的是**契约行为**，不要期望在当前代码上跑通。
@@ -18,7 +18,7 @@
 | 内容类型 | 请求与响应统一 `application/json` |
 | 时间戳 | 一律 Unix 秒（`int64`），**非** ISO8601，与 SQLite 存量字段一致 |
 | 金额 | 一律最小货币单位 `int64`（CNY 分 / USD cents），**禁止浮点** |
-| 分组标签 | `instances` / `snapshots` / `backups` / `networks` / `billing` / `nodes` |
+| 分组标签 | `instances` / `snapshots` / `backups` / `images` / `networks` / `billing` / `nodes` |
 
 ### 版本策略
 
@@ -53,7 +53,7 @@ curl -c jar.txt -X POST https://panel.example.com/login \
 curl -b jar.txt https://panel.example.com/v2/billing/plans
 ```
 
-未认证返回 `401` + `EYVES-203`。**注意**：`EYVES-203` 的语义是"账户不存在"，被复用为未认证标识，见 §3.13。
+未认证返回 `401` + `EYVES-203`。**注意**：`EYVES-203` 的语义是"账户不存在"，被复用为未认证标识，见 §3.14。
 
 ---
 
@@ -79,8 +79,8 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 
 ### 错误码全表
 
-分段约定：`1xx` 入参/金额 · `2xx` 余额与账本 · `3xx` 订单与状态机 · `4xx` 外部依赖编排。
-定义位置：[`internal/billing/errors.go`](../internal/billing/errors.go)。
+分段约定：`1xx` 入参/金额 · `2xx` 余额与账本 · `3xx` 订单与状态机 · `4xx` 外部依赖编排 · `7xx` 镜像与模板。
+`1xx`–`4xx` 定义位置：[`internal/billing/errors.go`](../internal/billing/errors.go)；`7xx` 见 [02-architecture.md §2.3.6](02-architecture.md)，**尚未实现**。
 
 | 错误码 | 常量名 | 含义 | 建议 HTTP |
 |---|---|---|---|
@@ -98,8 +98,18 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 | `EYVES-304` | `CodeRefundWindowExceeded` | 超出可退款时限 | 409 / 422 |
 | `EYVES-401` | `CodeProvisionFailed` | 实例编排失败（已自动退款） | 502 |
 | `EYVES-402` | `CodeInvalidRequest` | 领域层入参缺失 | 400 / 409 |
+| `EYVES-701` | — | 镜像不存在 | 404 |
+| `EYVES-702` | — | 镜像来源不可达 | 502 |
+| `EYVES-703` | — | 产物校验失败（sha256 / 格式 / 架构不符） | 422 |
+| `EYVES-704` | — | 来源不支持该操作（如对 `upload` 源调 refresh） | 422 |
+| `EYVES-705` | — | 镜像被实例引用，不可删除 | 409 |
+| `EYVES-706` | — | 目标节点不具备所需能力 | 409 |
+| `EYVES-707` | — | 镜像仓配额不足 | 507 |
+| `EYVES-708` | — | 上传会话无效或超限 | 422 |
+| `EYVES-709` | — | `url` 源缺少 checksum | 422 |
 
-> `EYVES-104` / `105` 已在代码中登记，但**尚未**被 openapi.yaml 的 responses 引用，见 §3.13。
+> `EYVES-104` / `105` 已在代码中登记，但**尚未**被 openapi.yaml 的 responses 引用，见 §3.14。
+> `EYVES-7xx` 段是**规划值**，`internal/image` 尚未实现，不得当作既有契约引用。
 
 ---
 
@@ -113,6 +123,7 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 | `POST /billing/recharges` | `ref`（必填） |
 | `POST /billing/orders/{orderNo}/renew` | `ref` |
 | `POST /networks/ipv6/subnets` | `ref` |
+| `POST /images/{id}/distribute` | `ref` |
 
 行为契约：
 
@@ -126,6 +137,13 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 ```
 
 > 上游计费系统（WHMCS）应把**自己的账单号**作为 `ref` 传入，保证跨系统可对账。
+
+**另有两类幂等不依赖 `ref`**：
+
+| 端点 | 幂等依据 | 说明 |
+|---|---|---|
+| `PUT /images/{id}/content` | `Content-Range` | 重复提交同一区间覆盖写，不报错，支持断点续传 |
+| `POST /images/{id}/distribute` | 目标节点状态 | 已 `ready` 的节点直接返回，不重复传输 |
 
 ---
 
@@ -143,6 +161,8 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 ```
 
 例外：`/instances/{id}/snapshots`、`/instances/{id}/backups`、`/instances/{id}/backups/schedules`、`/networks/ipv6/subnets`、`/billing/plans`、`/nodes` 直接返回数组（天然有界）。
+
+`/images` 是**分页**端点（用 `{items, total}` 信封），因为它会随管理员登记而持续增长，且需要按 `kind` / `arch` / `node_id` 多维过滤。
 
 ---
 
@@ -173,6 +193,18 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 | POST | `/instances/{id}/backups` | 创建备份（`note` / `compress`） | 202 |
 | GET | `/instances/{id}/backups/schedules` | 列出定时备份任务 | 200 |
 | POST | `/instances/{id}/backups/schedules` | 创建定时任务（五段 cron + `keep`） | 201 |
+
+### 镜像与模板（images）
+
+| 方法 | 路径 | 说明 | 成功码 |
+|---|---|---|---|
+| GET | `/images` | 列出镜像（可按 `kind` / `arch` / `format` / `source_type` / `node_id` / `status` 过滤，分页） | 200 |
+| POST | `/images` | **登记镜像（三种来源同一入口）** | 201 |
+| GET | `/images/{id}` | 镜像详情（含各形态产物 + 各节点分发状态） | 200 |
+| DELETE | `/images/{id}` | 删除镜像（被实例引用时 409 + `EYVES-705`） | 204 |
+| PUT | `/images/{id}/content` | **分片上传产物**（仅 `upload` 源，`Content-Range` 幂等） | 200 / 202 |
+| POST | `/images/{id}/distribute` | 分发 / 预热到节点（幂等） | 202 |
+| POST | `/images/{id}/refresh` | 检查上游更新（`apply` 决定是否落盘） | 200 |
 
 ### 网络（networks）
 
@@ -209,7 +241,7 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 | PUT | `/nodes/{id}/maintenance` | 切换维护模式（不参与新建调度） | 200 |
 | POST | `/nodes/{id}/migrations` | 发起跨节点迁移（`live=true` 仅 KVM） | 202 |
 
-**合计：26 路径 / 36 操作。**
+**合计：31 路径 / 43 操作。**
 
 ---
 
@@ -312,7 +344,179 @@ curl -X POST .../v2/instances/1042/backups/schedules \
 
 ---
 
-## 3.9 网络示例
+## 3.9 镜像与模板示例
+
+镜像模块回答三个问题：**有哪些镜像可用**、**在哪些节点上已经就绪**、**上游更新了怎么办**。
+三种来源共用同一登记入口，由 `source.type` 判别。
+
+### 来源一：simplestreams（目录别名）
+
+与现状 cub-panel 完全一致的行为 —— 由节点直连源站按别名拉取。同一别名（`debian/13`）同时提供容器 rootfs 与 KVM 磁盘镜像两种变体。
+
+```bash
+curl -X POST .../v2/images \
+  -H "Authorization: Bearer $EYVES_TOKEN" \
+  -d '{
+    "name": "debian/13",
+    "label": "Debian 13 (Trixie)",
+    "os_family": "debian",
+    "refresh_policy": "pin",
+    "source": {
+      "type": "simplestreams",
+      "server": "https://images.linuxcontainers.org",
+      "alias": "debian/13"
+    }
+  }'
+```
+
+```json
+{
+  "id": 12,
+  "name": "debian/13",
+  "label": "Debian 13 (Trixie)",
+  "os_family": "debian",
+  "status": "ready",
+  "refresh_policy": "pin",
+  "source": { "type": "simplestreams", "server": "https://images.linuxcontainers.org", "alias": "debian/13" },
+  "artifacts": [
+    { "kind": "container", "arch": "amd64", "format": "rootfs", "digest": "sha256:1a2b3c4d", "size_bytes": 138412032 },
+    { "kind": "vm",        "arch": "amd64", "format": "qcow2",  "digest": "sha256:5e6f7a8b", "size_bytes": 524288000 }
+  ],
+  "placements": [],
+  "created_at": 1758672000
+}
+```
+
+`source.server` 可指向自建内网镜像站或商业镜像服务 —— **这就是换源的全部操作**，不需要改代码、不需要重编译。
+
+### 来源二：url（直链导入）
+
+适用于自建模板托管。**`checksum` 必填**，缺失返回 `EYVES-709`；没有校验和的直链等于不设防。
+
+```bash
+curl -X POST .../v2/images \
+  -d '{
+    "name": "custom/rocky9-hardened",
+    "label": "Rocky 9 加固版",
+    "os_family": "rocky",
+    "refresh_policy": "pin",
+    "source": {
+      "type": "url",
+      "url": "https://mirror.internal.example.com/templates/rocky9-hardened.qcow2",
+      "checksum": "sha256:9f2c1a4e8b7d0356c8e1f2a3b4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7"
+    }
+  }'
+```
+
+登记时服务端只做 `Probe`（探测可达性 + 产物清单），**不下载文件内容**；文件由节点在分发时获取（`pull` 模式）或由主控入仓后推送（`push` 模式）。
+
+### 来源三：upload（分片上传）
+
+适用于私有模板、无外网场景。登记后先得到 `upload_id`，再用 `PUT` 分片上传。
+
+```bash
+# 1) 登记，创建 pending 记录
+curl -X POST .../v2/images \
+  -d '{
+    "name": "private/base-image-v3",
+    "label": "内部基础镜像 v3",
+    "source": { "type": "upload" }
+  }'
+# => { "id": 15, "status": "pending", "source": { "type": "upload", "upload_id": "up_7f3c1a2e" }, ... }
+
+# 2) 分片上传（Content-Range 幂等，可断点续传）
+curl -X PUT .../v2/images/15/content \
+  -H "Content-Type: application/octet-stream" \
+  -H "Content-Range: bytes 0-33554431/5368709120" \
+  --data-binary @chunk-000.bin
+# => 202 { "upload_id": "up_7f3c1a2e", "received_bytes": 33554432, "total_bytes": 5368709120,
+#          "received_ranges": ["0-33554431"], "expires_at": 1758758400 }
+
+# 3) 重复提交同一区间不报错（覆盖写）
+curl -X PUT .../v2/images/15/content \
+  -H "Content-Range: bytes 0-33554431/5368709120" \
+  --data-binary @chunk-000.bin
+# => 202（received_ranges 不变）
+
+# 4) 收齐后服务端校验 sha256 + magic bytes，通过才置 ready
+# => 200 { "id": 15, "status": "ready", "artifacts": [ ... ], ... }
+```
+
+| 约束 | 值 | 越界返回 |
+|---|---|---|
+| 单文件上限 | 32 GiB（`image.upload_max_bytes`） | `EYVES-708` |
+| 建议分片 | 32 MiB | — |
+| 会话有效期 | 24h（`image.upload_session_ttl`） | `EYVES-708` |
+| 格式判定 | **读 magic bytes，不信任扩展名** | `EYVES-703` |
+
+> 上传的 `Filename` 仅存元数据，**永不参与服务端路径拼接** —— 落盘名由主控生成 `{imageID}-{digest前缀}.{ext}`。
+
+### 分发 / 预热到节点
+
+**幂等**：目标节点已 `ready` 则直接返回，不重复传输。新节点上线后建议先批量预热，否则首位客户创建实例时会同步等镜像下载（被控侧超时给到 30 分钟）。
+
+```bash
+# 分发到指定节点
+curl -X POST .../v2/images/12/distribute \
+  -d '{"node_ids":[3,5],"ref":"prewarm-20260924"}'
+
+# 分发到所有非维护模式节点
+curl -X POST .../v2/images/12/distribute \
+  -d '{"all_nodes":true}'
+```
+
+```json
+{
+  "jobs": [
+    { "node_id": 3, "operation_id": "op_9f3c1a2e", "status": "queued" },
+    { "node_id": 5, "operation_id": "op_2b8d4f60", "status": "running" }
+  ]
+}
+```
+
+走**推**还是**拉**由服务端 `image.distribution` 配置决定，调用方无感。目标节点不具备该形态能力时返回 `409` + `EYVES-706`。
+
+### 上游更新：pin 与 track
+
+simplestreams 与 url 源的产物会随上游更新而变（新 digest）。**允许镜像静默变化是事故源** —— 客户机器在无人操作的情况下换了 rootfs。
+
+```bash
+# 先只报告差异，不落盘
+curl -X POST .../v2/images/12/refresh -d '{"apply":false}'
+# => { "updates": [ { "kind": "container", "arch": "amd64",
+#                     "current_digest": "sha256:1a2b3c4d",
+#                     "upstream_digest": "sha256:9f8e7d6c",
+#                     "size_bytes": 139460608, "applied": false } ] }
+
+# 按 policy 落盘
+curl -X POST .../v2/images/12/refresh -d '{"apply":true}'
+```
+
+| 策略 | `apply=true` 时行为 |
+|---|---|
+| `pin`（生产默认） | **不落盘**，仅产生审计告警。`applied` 恒为 `false` |
+| `track` | 新产物入库并分发；**新创建**的实例使用新版本，已存在实例不受影响 |
+
+**不变量**：已存在实例引用的产物**永不就地替换**。更新只产生新的 `Artifact`，两者以 `digest` 区分。
+
+对 `upload` 源调用 `refresh` 返回 `422` + `EYVES-704`（无上游可查）。
+
+### 删除
+
+```bash
+curl -X DELETE .../v2/images/12?purge_nodes=true
+# 有实例引用 => 409 { "code": "EYVES-705", "message": "image is referenced by instances" }
+```
+
+被实例引用时返回 `409` + `EYVES-705`，**`force` 不可绕过** —— 资金与数据安全优先于运维便利。
+
+### 套餐可见性
+
+镜像的套餐可见性**写在 `catalog.Plan.image_ids` 上，不在 image 模块内**：`image` 只回答「有什么、在哪」，`catalog` 回答「谁能买什么」。为空表示不限制（兼容旧 `plans.images` 别名列表语义）。
+
+---
+
+## 3.10 网络示例
 
 ```bash
 # 分配一个 /64 子网给实例 1042
@@ -341,7 +545,7 @@ curl -X PUT .../v2/networks/rdns \
 
 ---
 
-## 3.10 计费示例
+## 3.11 计费示例
 
 ```bash
 # 查询余额
@@ -405,7 +609,7 @@ curl -X POST .../v2/billing/orders/ORD-20260924-001/refund \
 
 ---
 
-## 3.11 节点管理示例
+## 3.12 节点管理示例
 
 ```bash
 # 添加节点
@@ -436,7 +640,7 @@ curl -X POST .../v2/nodes/3/migrations \
 
 ---
 
-## 3.12 旧接口兼容矩阵
+## 3.13 旧接口兼容矩阵
 
 | 旧路径 | 新路径 | 兼容状态 | 说明 |
 |---|---|---|---|
@@ -449,14 +653,17 @@ curl -X POST .../v2/nodes/3/migrations \
 
 ---
 
-## 3.13 已知问题（需在实现前裁决）
+## 3.14 已知问题（需在实现前裁决）
 
 | # | 问题 | 影响 | 建议 |
 |---|---|---|---|
 | A1 | `EYVES-203` 语义为"账户不存在"，却被复用为 `401 未认证` | 调用方无法区分「未登录」与「账号被删」 | 新增 `EYVES-204` 专表未认证 |
 | A2 | `EYVES-104` / `105` 已在代码登记，但 openapi 的 responses 未引用 | 文档与实现不完全对齐 | 在 `Unprocessable` 响应的 description 中补上 |
-| A3 | 36 个操作**全部缺少 `operationId`** | 无法自动生成 SDK / 客户端代码 | 按 `listInstances` / `createInstance` 风格补齐 |
+| A3 | 43 个操作**全部缺少 `operationId`** | 无法自动生成 SDK / 客户端代码 | 按 `listInstances` / `createInstance` 风格补齐 |
 | A4 | 多个端点无 `security` 覆盖差异声明（如 `/billing/recharges` 应仅允许 `apiKey`） | 权限边界模糊 | 按端点显式声明 `security` |
 | A5 | `Operation.status` 是字符串枚举，无对应轮询端点定义 | 异步操作无法查询进度 | 增加 `GET /v2/operations/{operationId}` |
 | A6 | 未定义限流响应（`429`）与 `Retry-After` | 客户端无退避依据 | 增加 `429` 响应与限流头 |
 | A7 | 未定义 Webhook / 事件回调契约 | WHMCS 只能轮询 | 规划 `/v2/webhooks`（P2） |
+| A8 | `PUT /images/{id}/content` 的 `Content-Range` 语义依赖 RFC 7233，但未声明 `Accept-Ranges` / `416 Range Not Satisfiable` | 客户端无法判断服务端是否支持断点续传，区间越界行为未定义 | 补 `416` 响应与 `Accept-Ranges: bytes` 声明 |
+| A9 | 镜像分发是异步作业，但 `ImageJob.operation_id` 指向的查询端点未定义（同 A5） | 无法跟踪预热进度 | 与 A5 一并解决 |
+| A10 | `source.type=upload` 的登记未声明所需 `Content-Length` 上限协商机制 | 客户端只能事后被拒（`EYVES-708`），无法预检 | 在 `CreateImageRequest` 增加可选 `total_bytes`，超限时登记阶段即拒绝 |

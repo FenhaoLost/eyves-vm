@@ -11,13 +11,15 @@
 |---|---|---|---|
 | 1 | 坏味道清单 | [01-bad-smells.md](file:///workspace/eyves-vm/docs/01-bad-smells.md) | ✅ 完成（含二轮复核修正） |
 | 2 | 目标架构 | [02-architecture.md](file:///workspace/eyves-vm/docs/02-architecture.md) | ✅ 完成 |
-| 3 | OpenAPI 3.0 | [openapi.yaml](file:///workspace/eyves-vm/api/openapi.yaml)（26 路径 / 36 操作 / 21 schema） | ⚠️ 完成但缺 `operationId`（见 7.3 第 6 条） |
+| 3 | OpenAPI 3.0 | [openapi.yaml](file:///workspace/eyves-vm/api/openapi.yaml)（31 路径 / 43 操作 / 36 schema） | ⚠️ 完成但缺 `operationId`（见 7.3 第 6 条） |
 | 4 | 数据迁移 | [04-migration.md](file:///workspace/eyves-vm/docs/04-migration.md)（字段映射）+ [0001 up](file:///workspace/eyves-vm/migrations/0001_billing_orders.up.sql) / [down](file:///workspace/eyves-vm/migrations/0001_billing_orders.down.sql) / [verify.sql](file:///workspace/eyves-vm/migrations/verify.sql) / [migrate-up.sh](file:///workspace/eyves-vm/migrations/migrate-up.sh) / [rollback.sh](file:///workspace/eyves-vm/migrations/rollback.sh) | ✅ 完成；`txid` 缺口已补，端到端实测 10/10 PASS |
 | 5 | 风险清单 | [05-risks.md](file:///workspace/eyves-vm/docs/05-risks.md) | ✅ 完成（P0 7 条 / P1 7 条 / P2 5 条） |
 | 6 | 计费模块重构 | [internal/billing](file:///workspace/eyves-vm/internal/billing)（9 文件）+ 迁移 + 测试 | ⚠️ 完成但缺续费/升级实现（见 7.3 第 5 条） |
 | 7 | 自审 | 本文 | ✅ 完成 |
 
-**未覆盖项（诚实声明）**：`catalog` / `instance` / `network` / `snapshot` / `cluster` / `hypervisor` 六个模块**只有设计（接口签名）与文档，没有可编译代码**；`/v2` 路由、`internal/store` 的 SQLite 适配器均未实现。第二部分是「目标架构」而非「已完成实现」，文档中所有非 `internal/billing` 的 Go 代码块都是接口定义，**不能当作可用代码引用**。
+**未覆盖项（诚实声明）**：`catalog` / `instance` / `image` / `network` / `snapshot` / `cluster` / `hypervisor` 七个模块**只有设计（接口签名）与文档，没有可编译代码**；`/v2` 路由、`internal/store` 的 SQLite 适配器均未实现。第二部分是「目标架构」而非「已完成实现」，文档中所有非 `internal/billing` 的 Go 代码块都是接口定义，**不能当作可用代码引用**。
+
+> 后续补录：`internal/image`（镜像与模板目录）是应「无法引入 simplestreams 之外的镜像」这一缺口新增的模块设计，见 [02-architecture.md §2.3.5](file:///workspace/eyves-vm/docs/02-architecture.md)。它同时是**接 KVM 的前置条件** —— libvirt 没有 simplestreams，KVM 的系统镜像必须靠 URL 导入 / 上传供给。
 
 ### 2) 坏味道清单是否每项都有 `文件:行号` 证据？
 
@@ -43,8 +45,8 @@ grep -rn 'go func()' --include='*.go' internal cmd | wc -l # 8
 ### 3) 架构图、接口签名、OpenAPI 是否完整？
 
 - Mermaid 图：5 张（模块划分 / 订单状态机 / 计费序列 / 节点注册 / 迁移序列 / 回滚决策树），✅ 语法均为 `flowchart`/`stateDiagram-v2`/`sequenceDiagram` 标准子集。
-- 接口签名：`Hypervisor`、`Lock`、`Repo`、`Nodes`、`Catalog.Repo`、`Allocator`、`Resolver`、`Health`、`Scheduler` 等 12 个，✅ 均为合法 Go 语法，已按「接口定义在调用方」约束放在消费侧包内。
-- OpenAPI：`$ref` 全部可解析（0 悬空），26 路径覆盖任务要求的 6 大域，✅；唯一硬缺口是 **36 个操作全部无 `operationId`**（脚本校验结果：`missing operationId: 36/36`）。
+- 接口签名：`Console`、`Hypervisor`、`Lock`、`Repo`×3、`Nodes`、`Distributor`、`Fetcher`、`Allocator`、`Resolver`、`Health`、`Scheduler` 共 **13 个**，✅ 均为合法 Go 语法，已按「接口定义在调用方」约束放在消费侧包内。
+- OpenAPI：`$ref` 全部可解析（**0 悬空**，实测 52 个引用），31 路径覆盖任务要求的 6 大域 + 镜像域，✅；唯一硬缺口是 **43 个操作全部无 `operationId`**（脚本校验结果：`missing operationId: 43/43`）。
 
 ### 4) 迁移脚本是否含 `up` 和 `down`？
 
@@ -101,7 +103,7 @@ ok  eyves/internal/billing  (cached)  coverage: 89.3% of statements
 | 3 | **一次性包装函数**：`moreThan` 仅被 `Refund` 调用一处，属过度抽象 | [service.go:L339-L345](file:///workspace/eyves-vm/internal/billing/service.go#L339-L345) | P2 | 内联为 `cmp, err := amount.Cmp(outstanding)`；删除 `moreThan` |
 | 4 | **时间源非幂等**：`newOrder` 内连续两次 `s.clock()`，若注入的 Clock 每次返回不同值则 `CreatedAt != UpdatedAt` | [service.go:L171-L172](file:///workspace/eyves-vm/internal/billing/service.go#L171-L172) | P2 | `now := s.clock()` 取一次，两字段共用 |
 | 5 | **功能缺口**：任务要求计费模块含"续费"，但 `Service` 只实现 `Purchase`/`Refund`，无 `Renew`/`Upgrade` | [service.go](file:///workspace/eyves-vm/internal/billing/service.go)（全文） | P1 | 按架构 [2.4.4](file:///workspace/eyves-vm/docs/02-architecture.md) 的签名实现 `Renew`（新建 `Kind=renew` 订单 + 延长 `DueAt`），复用同一幂等与补偿路径；`Upgrade` 需注入 `PlanRepo`，先扩 `Deps` 再实现 |
-| 6 | **OpenAPI 缺 `operationId`**：36/36 个操作缺失，无法生成 SDK、无法做链路追踪命名 | [openapi.yaml](file:///workspace/eyves-vm/api/openapi.yaml)（全文件） | P1 | 每个操作补 `operationId`，命名约定 `instances.create` / `orders.refund`（资源.动作，全小写）；补充 CI 校验：`$ref` 无悬空 + `operationId` 唯一非空 |
+| 6 | **OpenAPI 缺 `operationId`**：43/43 个操作缺失，无法生成 SDK、无法做链路追踪命名 | [openapi.yaml](file:///workspace/eyves-vm/api/openapi.yaml)（全文件） | P1 | 每个操作补 `operationId`，命名约定 `instances.create` / `orders.refund`（资源.动作，全小写）；补充 CI 校验：`$ref` 无悬空 + `operationId` 唯一非空 |
 | 7 | ~~**数据迁移丢字段**：`recharge_orders.txid` 未映射到 `orders`~~ | ~~[0001_billing_orders.up.sql:L48-L60](file:///workspace/eyves-vm/migrations/0001_billing_orders.up.sql) vs 旧表 [schema.sql:L191](file:///workspace/cub-panel/src/internal/store/schema.sql#L191)~~ | ~~**P0**~~ | ✅ **已修复**：`orders` 新增 `external_txid` 并回填 `o.txid`；`verify.sql` 新增检查项 9；实测 `PASS new=2 legacy=2` |
 | 8 | **幂等键格式分裂**（残余）：SQL 侧已固化 `'order:' ‖ order_no`，但 Go 侧无对应函数，适配器/网关回调若自行拼串仍会漂移 | [0001_billing_orders.up.sql:L58](file:///workspace/eyves-vm/migrations/0001_billing_orders.up.sql#L58) vs [schema.sql:L177](file:///workspace/cub-panel/src/internal/store/schema.sql#L177) | P0（残余） | 新增 `func OrderRef(orderNo string) string { return "order:" + orderNo }` 到 `billing` 包，适配器与回调路径一律调用它；`verify.sql` 检查项 10 已能捕获漂移（实测 FAIL → exit 5） |
 | 9 | **超范围声明**：`docs/02` 曾出现 `pkg/idgen`（仓库无此包）、错误码表与 `errors.go` 不符 | 已在本次审查中修正：[02-architecture.md 目录树](file:///workspace/eyves-vm/docs/02-architecture.md)、[错误码表](file:///workspace/eyves-vm/docs/02-architecture.md) | P1 | 已改；后续任何"规划中"的包/常量必须在文档中显式标注「未实现」，禁止与既有契约混排 |

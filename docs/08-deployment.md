@@ -431,6 +431,24 @@ CUB_PANEL_LISTEN=127.0.0.1:8080  # 收回公网监听
 | `CUB_PANEL_ALLOW_SIGNUP` | `panel.allow_signup` |
 | `CUB_PANEL_SITE` | `panel.site_name` |
 | `CUB_AGENT_ENDPOINT` | 存库 `nodes.endpoint`（不在配置文件里） |
+| `CUB_AGENT_IMAGE_SERVER` | `image.default_simplestreams_server`（也可逐镜像 `source.server` 覆盖） |
+
+#### `image` 段（镜像与模板）
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `image.distribution` | `pull` | `pull` 节点自行下载；`push` 主控入仓后推送（内网无外网节点） |
+| `image.cache_dir` | `/var/lib/eyves/images` | 仅 `push` 模式使用的面板镜像仓 |
+| `image.max_cache_bytes` | 200 GiB | 超出拒绝新镜像（`EYVES-707`）；`0` = 不限 |
+| `image.default_refresh_policy` | `pin` | `pin` 上游更新不落盘；`track` 跟随 |
+| `image.refresh_interval` | `24h` | 上游更新检查周期；`0` = 关闭定时检查 |
+| `image.upload_max_bytes` | 32 GiB | 分片上传单文件上限（`EYVES-708`） |
+| `image.upload_chunk_bytes` | 32 MiB | 服务端建议分片大小 |
+| `image.upload_session_ttl` | `24h` | 上传会话有效期 |
+| `image.default_simplestreams_server` | `https://images.linuxcontainers.org` | 仅作登记默认值 |
+| `image.reconcile_interval` | `30m` | 与节点实际持有情况对账周期 |
+
+> **换源不需要改代码**：把 `default_simplestreams_server` 指向自建内网镜像站即可。这是把镜像源做成配置项而非硬编码直链的核心收益。
 
 ---
 
@@ -590,8 +608,9 @@ sqlite3 /opt/cub-panel/data/panel.db \
 | 1 | `cmd/eyves-panel` / `cmd/eyves-agent` 入口 | 无进程可启动 |
 | 2 | `internal/app` 依赖装配 | 无法组装 domain 与适配器 |
 | 3 | SQLite 适配器（`Ledger` / `OrderRepo`） | 领域层无持久化 |
-| 4 | `/v2` HTTP 路由与错误映射 | 26 路径 / 36 操作不可访问 |
+| 4 | `/v2` HTTP 路由与错误映射 | 31 路径 / 43 操作不可访问 |
 | 5 | Hypervisor 抽象层实现 | 无法创建实例 |
-| 6 | Web UI（模板或 SPA） | 无界面 |
+| 6 | **image 模块实现** | 无镜像供给；**接 KVM 的前置条件**（libvirt 无 simplestreams） |
+| 7 | Web UI（模板或 SPA） | 无界面 |
 
 补齐顺序与风险见 [05-risks.md](05-risks.md) 与 [06-features.md §6.6](06-features.md)。

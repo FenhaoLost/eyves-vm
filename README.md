@@ -14,10 +14,11 @@ Eyves VM 是从 [cub-panel](https://github.com/wd780h/cub-panel) 演进而来的
 |---|---|---|---|
 | 计费 billing | ✅ **已实现** | [internal/billing](internal/billing) | Money / Order 状态机 / Service，36 个测试函数 / 97 个用例，覆盖率 89.3%，零外部依赖 |
 | 数据库迁移 | ✅ **已实现** | [migrations](migrations) | `0001` up/down + 10 项校验 + 备份回滚脚本 |
-| API 规范 | ✅ **已定稿** | [api/openapi.yaml](api/openapi.yaml) | 26 路径 / 36 操作 / 21 schema，`$ref` 无悬空 |
-| 架构设计 | 📐 设计态 | [docs/02-architecture.md](docs/02-architecture.md) | Mermaid 模块图 + 12 个 Go 接口签名 |
+| API 规范 | ✅ **已定稿** | [api/openapi.yaml](api/openapi.yaml) | 31 路径 / 43 操作 / 36 schema，`$ref` 无悬空 |
+| 架构设计 | 📐 设计态 | [docs/02-architecture.md](docs/02-architecture.md) | Mermaid 模块图 + 13 个 Go 接口定义 |
 | Hypervisor 抽象层 | 📐 设计态 | docs/02 §2.3 | `Hypervisor` 接口 + Incus 适配器签名，**无实现** |
 | 实例 instance | 📐 设计态 | docs/02 §2.3 | **无实现** |
+| **镜像 image** | 📐 设计态 | [docs/02 §2.3.5](docs/02-architecture.md) | 三种来源（simplestreams / url / upload）+ 推拉分发 + 上游更新策略，**无实现** |
 | 网络 network | 📐 设计态 | docs/02 §2.5 | IPv6 子网 / rDNS / 多网卡，**无实现** |
 | 快照备份 snapshot | 📐 设计态 | docs/02 §2.3 | **无实现**。注意：cub-panel 已有用户自助快照（套餐配额 + 被控 API），Eyves VM 要加的是快照链、容量计量、定时备份与异地投递 |
 | 集群 cluster | 📐 设计态 | docs/02 §2.6 | **无实现** |

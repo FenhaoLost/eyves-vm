@@ -27,14 +27,17 @@ flowchart TB
         BILL["billing\n订单 / 余额 / 退款 / 续费\n（已完成）"]
         CAT["catalog\n套餐 / 定价 / 代理商"]
         INST["instance\n实例生命周期状态机"]
+        IMG["image\n镜像目录 / 三种来源 / 分发"]
         NET["network\nIPv6 子网 / rDNS / 多网卡"]
         SNAP["snapshot\n快照 / 备份 / 定时调度"]
         CLUS["cluster\n节点注册 / 健康 / 迁移"]
     end
 
-    subgraph port["端口层 internal/hypervisor, internal/store"]
+    subgraph port["端口层 internal/hypervisor, internal/store, 各领域端口"]
         HV["hypervisor.Hypervisor\n（接口）"]
         REPO["各领域 Repository 接口\n（在调用方定义）"]
+        IGPORT["image.Distributor / image.Fetcher\n（在 image 包定义）"]
+        AGAPI["agentapi\n主控→被控 客户端（HTTPS + HMAC）"]
     end
 
     subgraph adapters["适配器 internal/hypervisor/{incus,kvm,openvz}, internal/store/{sqlite,postgres}"]
@@ -45,12 +48,15 @@ flowchart TB
     end
 
     AGENT --> HV
-    PANEL --> BILL & CAT & INST & NET & SNAP & CLUS
+    PANEL --> BILL & CAT & INST & IMG & NET & SNAP & CLUS
     BILL --> REPO
     INST --> HV
     NET --> HV
     SNAP --> HV
     CLUS --> HV & REPO
+    IMG --> REPO & IGPORT
+    IGPORT --> AGAPI
+    AGAPI -.HTTPS+HMAC.-> AGENT
     HV --> INCUS & KVM & OVZ
     REPO --> DB
     WIRE -.装配.-> PANEL & AGENT
@@ -71,6 +77,7 @@ eyves-vm/
 │   ├── billing/        # ✅ 已完成：Money / Order / Service / errors
 │   ├── catalog/        # 套餐、定价、促销、代理商分成
 │   ├── instance/       # 实例生命周期（状态机 + 动作编排）
+│   ├── image/          # 镜像目录：三种来源、分发、上游更新跟踪
 │   ├── network/        # IPv6 子网分配、rDNS、多网卡
 │   ├── snapshot/       # 快照 / 备份 / 定时任务
 │   ├── cluster/        # 节点注册、健康检查、跨节点迁移
@@ -512,7 +519,271 @@ type ListFilter struct {
 
 `catalog` 只负责**定价查询**；扣款与订单由 `billing` 负责。二者通过 `Plan.Price` 在 `internal/app` 装配处对接，避免双向依赖。
 
-### 2.3.5 `internal/errs`（结构化错误，全站统一）
+### 2.3.5 `internal/image`（镜像与模板目录）
+
+**职责**：回答三个问题 ——「有哪些镜像可用」「在哪些节点上已经就绪」「上游更新了怎么办」。
+
+现状（cub-panel）只能走一条路：`simplestreams` 别名，由节点自行拉取，`plans.images` 白名单控制可见性。缺口是**无法引入 simplestreams 之外的系统镜像**（自建 qcow2、私有发行版、客户指定版本）。接 KVM 后这会变成硬需求 —— **libvirt 没有 simplestreams**，镜像必须靠「URL 导入 / 上传」供给。
+
+#### 边界：与 `hypervisor` 抽象层正交
+
+| 模块 | 回答的问题 | 不负责 |
+|---|---|---|
+| `image` | 镜像**从哪来、是什么格式、在哪些节点上有** | 不碰虚拟化后端、不创建实例 |
+| `hypervisor` | **怎么把镜像装成实例** | 不管镜像来源、不做目录管理 |
+
+二者只通过一个中间表示对接：`hypervisor.Spec.ImageRef string`。取值由适配器自行解释 —— Incus 适配器接受 simplestreams 别名或本地指纹，KVM 适配器接受主控镜像仓的 qcow2 路径或 URL。**业务层永远不出现具体后端的镜像地址**。
+
+#### 三种来源
+
+| 来源 | 形态 | 引入原因 | 上游更新 |
+|---|---|---|---|
+| `simplestreams` | 目录别名 + 源站地址 | Incus/LXD 生态原生，发行版最全 | 可跟随（`track`）或锁定（`pin`） |
+| `url` | 直链 + **必填 sha256** | SolusVM / Virtualizor 惯例；自建模板托管 | 需显式 `refresh` |
+| `upload` | 分片上传，主控落盘 | 私有模板、无外网场景 | 不支持 |
+
+#### 关键决策一：分发模型 —— 推还是拉
+
+| 模型 | 流程 | 优点 | 缺点 | 适用 |
+|---|---|---|---|---|
+| **拉（pull）** | 节点直连来源地址自行下载 | 主控零带宽零磁盘；实现最简 | 节点必须能访问外网；内网私有 URL 不可达；N 个节点重复下载 N 次 | 默认，小微 / 公网节点 |
+| **推（push）** | 主控下载一次入本地镜像仓，再推给各节点 | 一次下载多节点复用；节点可无外网 | 主控承担带宽与磁盘；需要请求体签名流式转发 | 企业内网 / 免外网节点 |
+
+```yaml
+image:
+  distribution: pull        # pull | push
+  # push 模式下主控镜像仓
+  cache_dir: /var/lib/eyves/images
+  max_cache_bytes: 214748364800   # 200 GiB，0 = 不限
+```
+
+**决策**：两种都实现，默认 `pull`（与现状零成本兼容）。`Distributor` 接口对上层隐藏差异 —— 调用方只说「保证这 N 个节点有镜像」，走推还是走拉由装配决定。
+
+#### 关键决策二：上游更新语义
+
+simplestreams 与 URL 源的产物会随上游更新而变（新 sha256）。**允许镜像静默变化是事故源**：客户机器在没有任何人操作的情况下换了 rootfs，重装了客户数据、或某次重启后行为不一致。
+
+```go
+// RefreshPolicy 决定上游出现新版本时的行为。
+type RefreshPolicy string
+
+const (
+	// RefreshPin 锁定指纹：上游更新被检测到但**不落盘**，仅产生一条审计告警。
+	// 生产环境默认值。客户实例引用的产物永远不变。
+	RefreshPin RefreshPolicy = "pin"
+
+	// RefreshTrack 跟随上游：新产物入库并分发；**新创建**的实例使用新版本，
+	// 已存在实例不受影响（Incus 侧靠指纹区分，KVM 侧靠克隆时复制）。
+	RefreshTrack RefreshPolicy = "track"
+)
+```
+
+**不变量**：已存在实例引用的产物**永不就地替换**。更新只能产生新的 `Artifact`，两者以 `digest` 区分。
+
+#### 接口签名
+
+```go
+package image
+
+import (
+	"context"
+	"io"
+	"time"
+)
+
+// ---------- 枚举（类型化常量，禁止裸字符串） ----------
+
+// Kind 是产物形态。
+type Kind string
+
+const (
+	KindContainer Kind = "container" // LXC/Incus 容器 rootfs
+	KindVM        Kind = "vm"        // KVM 虚拟机磁盘镜像
+)
+
+// Arch 是 CPU 架构，与 simplestreams 命名对齐。
+type Arch string
+
+const (
+	ArchAMD64 Arch = "amd64"
+	ArchARM64 Arch = "arm64"
+	ArchARMHF Arch = "armhf"
+	ArchI386  Arch = "i386"
+)
+
+// Format 是产物文件格式。
+type Format string
+
+const (
+	FormatRootfs Format = "rootfs" // tar.xz / tar.gz
+	FormatQcow2  Format = "qcow2"
+	FormatRaw    Format = "raw"
+)
+
+// SourceType 是来源类型。
+type SourceType string
+
+const (
+	SourceSimplestreams SourceType = "simplestreams"
+	SourceURL           SourceType = "url"
+	SourceUpload        SourceType = "upload"
+)
+
+// PlacementStatus 是镜像在单个节点上的存在状态。
+type PlacementStatus string
+
+const (
+	PlacementAbsent  PlacementStatus = "absent"  // 节点上没有
+	PlacementSyncing PlacementStatus = "syncing" // 分发中
+	PlacementReady   PlacementStatus = "ready"   // 就绪可用
+	PlacementFailed  PlacementStatus = "failed"  // 分发失败，Error 携因
+)
+
+// ---------- 实体 ----------
+
+// Artifact 是某个 (Kind, Arch, Format) 下的具体产物文件。
+type Artifact struct {
+	Kind      Kind
+	Arch      Arch
+	Format    Format
+	Digest    string // "sha256:<hex>"，唯一身份，更新即换 digest
+	SizeBytes int64
+	SourceRef string    // simplestreams 指纹 / 原始 URL / 主控镜像仓内路径
+	FetchedAt time.Time // push 模式下为入库时间；pull 模式下为对账观测时间
+}
+
+// Placement 是镜像在某个节点上的存在状态（对账得出的观测值，不是愿望值）。
+type Placement struct {
+	NodeID    int64
+	Status    PlacementStatus
+	Digest    string
+	Error     string
+	CheckedAt time.Time
+}
+
+// Source 描述镜像从哪来。Type 为判别式，三种来源互斥。
+type Source struct {
+	Type SourceType
+
+	// Type == SourceSimplestreams
+	Server string // 源站基址，如 https://images.linuxcontainers.org
+	Alias  string // 形如 debian/13；同一别名同时提供 container 与 vm 变体
+
+	// Type == SourceURL（Checksum 必填，缺失时 Register 返回 ErrChecksumRequired）
+	URL      string
+	Checksum string // "sha256:<hex>"
+
+	// Type == SourceUpload（UploadID 由 Register 返回，随分片上传推进）
+	UploadID string
+	Filename string
+}
+
+// Image 是镜像目录条目（聚合根）。
+type Image struct {
+	ID         int64
+	Name       string // 与旧 agent imageRe 同一字符集：^[a-zA-Z0-9][a-zA-Z0-9._/-]{1,63}$
+	Label      string
+	OSFamily   string // debian / ubuntu / alpine / …，仅用于界面分组
+	Source     Source
+	Policy     RefreshPolicy
+	Artifacts  []Artifact
+	Placements []Placement
+	CreatedAt  time.Time
+}
+
+// ---------- 端口（在调用方定义，实现方返回具体类型） ----------
+
+// Repo 是镜像目录的持久化端口。
+type Repo interface {
+	Create(ctx context.Context, img *Image) (int64, error)
+	ByID(ctx context.Context, id int64) (*Image, error)
+	ByName(ctx context.Context, name string) (*Image, error)
+	Update(ctx context.Context, img *Image) error
+	Delete(ctx context.Context, id int64) error
+	List(ctx context.Context, filter Filter) ([]*Image, int64, error)
+	// UpsertPlacement 写入对账观测值；同 (imageID, nodeID) 覆盖。
+	UpsertPlacement(ctx context.Context, imageID int64, p Placement) error
+	// ReferencedBy 返回引用该镜像的实例 ID；非空时禁止删除。
+	ReferencedBy(ctx context.Context, imageID int64) ([]int64, error)
+}
+
+// Distributor 把产物落到节点上。实现走 internal/agentapi，本包不引入网络。
+type Distributor interface {
+	// Ensure 幂等保证 target 节点具备该镜像的全部产物；已就绪则直接返回 ready。
+	Ensure(ctx context.Context, imageID int64, nodeIDs []int64) ([]Job, error)
+	// Remove 清除节点缓存副本；有实例引用时必须返回 ErrImageInUse。
+	Remove(ctx context.Context, imageID int64, nodeIDs []int64) error
+	// List 拉取节点实际持有的镜像，用于纠正 placements 漂移。
+	List(ctx context.Context, nodeID int64) ([]Placement, error)
+}
+
+// Fetcher 与来源交互。push 模式用它取文件，pull 模式只用它探测元数据。
+type Fetcher interface {
+	// Probe 探测来源并返回可用产物清单，不下载文件内容。
+	Probe(ctx context.Context, src Source) ([]Artifact, error)
+	// Open 打开产物内容流；仅 push 分发模式使用。
+	Open(ctx context.Context, a Artifact) (io.ReadCloser, error)
+	// CheckUpdate 对比上游，返回存在新 digest 的产物。
+	CheckUpdate(ctx context.Context, img *Image) ([]ArtifactUpdate, error)
+}
+
+// ---------- 服务（唯一入口） ----------
+
+// Service 是镜像模块的唯一对外入口。
+type Service struct {
+	repo   Repo
+	dist   Distributor
+	fetch  Fetcher
+	policy RefreshPolicy // 新建镜像的默认更新策略
+	clock  func() time.Time
+}
+
+// New 由 internal/app 装配；返回具体类型。
+func New(repo Repo, dist Distributor, fetch Fetcher, opts Options) (*Service, error)
+
+// Register 登记镜像。三种来源同一入口：
+//   - simplestreams / url：Probe 校验可达性与格式后立即置 ready；
+//   - upload：创建 pending 记录并返回 UploadID，待 Upload 收齐后转 ready。
+func (s *Service) Register(ctx context.Context, req RegisterRequest) (*Image, error)
+
+// Upload 追加一个分片，仅 upload 源可用。按 Content-Range 幂等：重复分片覆盖不报错。
+// 收齐后校验 sha256 与 magic bytes 格式探测，通过才置 ready。
+func (s *Service) Upload(ctx context.Context, imageID int64, rng ByteRange, r io.Reader) (*UploadProgress, error)
+
+// Distribute 分发到指定节点（AllNodes 与 NodeIDs 二选一），返回逐节点作业句柄。
+func (s *Service) Distribute(ctx context.Context, imageID int64, target Target) ([]Job, error)
+
+// Refresh 检查上游更新。apply=false 只报告；apply=true 时按 Policy 决定是否落盘与重分发。
+func (s *Service) Refresh(ctx context.Context, imageID int64, apply bool) ([]ArtifactUpdate, error)
+
+// Delete 删除镜像。被实例引用时返回 ErrImageInUse —— force 不绕过（资金与数据安全优先）。
+func (s *Service) Delete(ctx context.Context, imageID int64, purgeNodes bool) error
+
+// Bundle 返回某节点上对某形态可用的产物集合，供 instance 在创建前做前置校验，
+// 避免"下单成功、下发时才报没有镜像"（现状 cub-panel 依赖跨节点逐个试，见 docs/05-risks.md）。
+func (s *Service) Bundle(ctx context.Context, nodeID int64, kind Kind, arch Arch) ([]Artifact, error)
+
+// Reconcile 与节点实际持有情况对账，纠正 placements。由定时任务调用。
+func (s *Service) Reconcile(ctx context.Context, nodeID int64) (ReconcileReport, error)
+```
+
+#### 上传通道的安全约束
+
+| 约束 | 做法 |
+|---|---|
+| 格式探测 | **不信任扩展名**。读 magic bytes 判定（qcow2 头部 `QFI\xfb`、gzip `\x1f\x8b`、xz `\xfd7zXZ`、tar.xz 组合） |
+| 完整性 | sha256 必校验；upload 源由主控边收边算，用户提供的 sha256 只作交叉比对 |
+| 架构探测 | qcow2 读 header 的架构位；无法判定时要求请求显式声明 `Arch` |
+| 路径穿越 | 落盘名由主控生成（`{imageID}-{digest前缀}.{ext}`），**用户提供的 Filename 仅存元数据，永不参与路径拼接** |
+| 大小上限 | `image.upload_max_bytes`（默认 32 GiB），超限立即中断并返回 `EYVES-708` |
+| 会话有效期 | UploadID 默认 24h 过期，过期后分片全部作废 |
+| 并发 | 同一 Image 的并发分片按 offset 加锁串行写入，避免交错写坏文件 |
+
+#### 可见性归属（避免双事实源）
+
+镜像的**套餐可见性**仍写在 `catalog.Plan` 上（`image_ids`），**不在 `image` 模块内**。理由与 `billing`/`catalog` 的切分一致：`image` 只回答「有什么、在哪」，`catalog` 回答「谁能买什么」。
+
+### 2.3.6 `internal/errs`（结构化错误，全站统一）
 
 分段规则以**已实现**的 [errors.go](file:///workspace/eyves-vm/internal/billing/errors.go#L25-L43) 为唯一事实来源，其余域按同一分段扩展：
 
@@ -522,6 +793,7 @@ type ListFilter struct {
 | `EYVES-2xx` | 余额与账本（已实现） | `201` 余额不足、`202` 幂等 ref 重复、`203` 账户不存在 |
 | `EYVES-3xx` | 订单与状态机（已实现） | `301` 订单不存在、`302` 非法流转、`303` 不可退款、`304` 超出退款时限（已定义，待 Renew/Upgrade 联调时启用） |
 | `EYVES-4xx` | 外部依赖编排（已实现） | `401` 编排失败、`402` 领域入参缺失 |
+| `EYVES-7xx` | 镜像与模板（**规划值，尚未实现**） | `701` 镜像不存在、`702` 来源不可达、`703` 产物校验失败（sha256/格式/架构不符）、`704` 来源不支持该操作、`705` 镜像被实例引用不可删、`706` 目标节点不具备所需能力、`707` 镜像仓配额不足、`708` 上传会话无效或超限、`709` url 源缺少 checksum |
 | `EYVES-0xx` / `5xx` / `6xx` | 基础设施 / 集群 / 网络（预留下沉到 `internal/errs`） | 本文件为规划值，**尚未实现，不得当作既有契约引用**：`EYVES-001` 配置无效、`EYVES-002` 内部错误、`EYVES-501` 节点离线、`EYVES-601` 子网耗尽 |
 
 > 自审修正：本节初版把 `EYVES-203` 写成"账本失败"并与 001/002 混排，与 `errors.go` 实际定义不符，已按代码改写。新增错误码必须先在 `errors.go` 登记。
@@ -861,7 +1133,39 @@ func AllowedFeatures() map[string]bool
 func FeatureAllowed(name string) bool
 ```
 
-新增能力（快照配额、IPv6 多地址、迁移）以**新增请求字段**方式加入，且面板端必须容忍老 agent 不认识的字段（被控端拒绝未知字段会导致老 agent 无法升级）。
+新增能力（快照配额、IPv6 多地址、迁移、镜像分发）以**新增端点或新增请求字段**方式加入，且面板端必须容忍老 agent 不认识的字段（被控端拒绝未知字段会导致老 agent 无法升级）。
+
+镜像模块需要被控端提供一个新的统一入口。现有 agent 的 `POST /v1/images`（按别名拉取）与 `DELETE /v1/images/{fingerprint}` 语义不变，新增：
+
+```go
+// POST /v1/images/ensure
+//
+// 幂等地保证节点上存在指定镜像产物，覆盖三种来源。旧面板不认识该端点，
+// 因此必须与旧端点并存，不可替换。
+type ImageEnsureRequest struct {
+	Name      string `json:"name"`       // 镜像逻辑名，与旧 imageRe 同字符集
+	Kind      string `json:"kind"`       // container | vm
+	Arch      string `json:"arch"`       // amd64 | arm64 | armhf | i386
+	Digest    string `json:"digest"`     // sha256:<hex>，节点据此判重
+	Source    struct {
+		Type     string `json:"type"`     // simplestreams | url | push
+		Server   string `json:"server"`   // type=simplestreams
+		Alias    string `json:"alias"`    // type=simplestreams
+		URL      string `json:"url"`      // type=url，节点直接拉
+		Checksum string `json:"checksum"` // type=url，必填
+		// type=push 时节点从请求体读取流，由面板侧流式转发
+	} `json:"source"`
+}
+
+type ImageEnsureResponse struct {
+	Status   string `json:"status"`   // ready | syncing | failed
+	Digest   string `json:"digest"`   // 节点实际持有的指纹（可能因去重与请求不同）
+	SizeBytes int64 `json:"size_bytes"`
+	Error    string `json:"error,omitempty"`
+}
+```
+
+`type=push` 时请求改为 `Content-Type: application/octet-stream` + `X-Eyves-Digest` 头，请求体为产物字节流；被控边收边校验，校验失败即丢弃并返回 `EYVES-703`。**面板到被控的 HMAC 签名覆盖路径 + 时间戳 + 头部，不覆盖请求体**（体可能是几十 GB，无法整体缓冲）—— 因此 push 模式的安全性依赖 sha256 校验而非签名，这一点必须在实现时显式记录。
 
 ## 2.8 CGO 与构建约束
 

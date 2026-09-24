@@ -86,6 +86,38 @@ hypervisor:
     enabled: false                 # 预留，未实现
     vzctl_path: ""
 
+image:
+  # 镜像与模板目录（internal/image）。
+  #
+  # 分发模型：pull = 节点直连来源自行下载（默认，与现状零成本兼容）；
+  #           push = 主控下载一次入本地镜像仓，再推给各节点（企业内网 / 免外网节点）。
+  # 两种模式对上层调用方无感，由 internal/app 装配时选择。
+  distribution: "pull"             # pull | push
+
+  # push 模式下的主控镜像仓。
+  cache_dir: "/var/lib/eyves/images"
+  max_cache_bytes: 214748364800    # 200 GiB；0 = 不限。超出后拒绝新镜像（EYVES-707）
+
+  # 新建镜像的默认上游更新策略：
+  #   pin   锁定指纹，上游更新不落盘，仅产生审计告警（生产默认）
+  #   track 跟随上游，新产物入库并分发；已存在实例引用的产物永不就地替换
+  default_refresh_policy: "pin"
+
+  # 检查上游更新的周期（0 = 关闭定时检查，仅手工触发 refresh 接口）。
+  refresh_interval: 24h
+
+  # 分片上传（source.type=upload）限制。
+  upload_max_bytes: 34359738368    # 32 GiB，超限立即中断（EYVES-708）
+  upload_chunk_bytes: 33554432     # 32 MiB，服务端建议的分片大小
+  upload_session_ttl: 24h          # 上传会话有效期，过期分片全部作废
+
+  # simplestreams 默认源站。仅作为登记镜像时的默认值，
+  # 单个镜像可在 source.server 覆盖（支持内网镜像站 / 商业镜像服务）。
+  default_simplestreams_server: "https://images.linuxcontainers.org"
+
+  # 对账周期：拉取节点实际持有的镜像，纠正 placements 漂移。
+  reconcile_interval: 30m
+
 agent:
   # 主控 → 被控的通信（HTTPS + HMAC，协议保持不变）。
   scheme: "https"
