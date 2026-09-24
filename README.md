@@ -19,7 +19,7 @@ Eyves VM 是从 [cub-panel](https://github.com/wd780h/cub-panel) 演进而来的
 | Hypervisor 抽象层 | 📐 设计态 | docs/02 §2.3 | `Hypervisor` 接口 + Incus 适配器签名，**无实现** |
 | 实例 instance | 📐 设计态 | docs/02 §2.3 | **无实现** |
 | 网络 network | 📐 设计态 | docs/02 §2.5 | IPv6 子网 / rDNS / 多网卡，**无实现** |
-| 快照备份 snapshot | 📐 设计态 | docs/02 §2.3 | **无实现** |
+| 快照备份 snapshot | 📐 设计态 | docs/02 §2.3 | **无实现**。注意：cub-panel 已有用户自助快照（套餐配额 + 被控 API），Eyves VM 要加的是快照链、容量计量、定时备份与异地投递 |
 | 集群 cluster | 📐 设计态 | docs/02 §2.6 | **无实现** |
 | 套餐目录 catalog | 📐 设计态 | docs/02 §2.4 | **无实现** |
 | Web UI / `cmd/` 入口 | ❌ 未开始 | — | 无 HTTP 路由、无模板、无 `main.go` |
