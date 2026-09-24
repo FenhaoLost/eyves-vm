@@ -97,7 +97,7 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 | `EYVES-303` | `CodeOrderNotRefundable` | 订单当前状态不可退款 | 409 |
 | `EYVES-304` | `CodeRefundWindowExceeded` | 超出可退款时限 | 409 / 422 |
 | `EYVES-401` | `CodeProvisionFailed` | 实例编排失败（已自动退款） | 502 |
-| `EYVES-402` | `CodeInvalidRequest` | 领域层入参缺失 | 400 / 409 |
+| `EYVES-402` | `CodeInvalidRequest` | 领域层入参缺失；**并扩展用于「对当前资源无效」**，例如 `cycle` 未在该套餐 `prices` 中定价 | 400 / 409 / 422 |
 | `EYVES-701` | — | 镜像不存在 | 404 |
 | `EYVES-702` | — | 镜像来源不可达 | 502 |
 | `EYVES-703` | — | 产物校验失败（sha256 / 格式 / 架构不符） | 422 |
@@ -173,7 +173,7 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 | 方法 | 路径 | 说明 | 成功码 |
 |---|---|---|---|
 | GET | `/instances` | 列出实例（可按 `node_id` / `status` 过滤） | 200 |
-| POST | `/instances` | **创建实例（下单 + 扣款 + 下发）** | 201 |
+| POST | `/instances` | **创建实例（下单 + 扣款 + 下发）**；传 `cycle`，响应 `{instance, order}` | 201 |
 | GET | `/instances/{id}` | 实例详情 | 200 |
 | DELETE | `/instances/{id}` | 删除实例（`keep_data=true` 保留数据盘） | 204 |
 | POST | `/instances/{id}/actions` | 电源操作 `start\|stop\|restart`，支持 `force` | 202 |
@@ -227,7 +227,7 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 | POST | `/billing/recharges` | **充值入账（服务端到服务端，幂等）** | 200 |
 | GET | `/billing/orders` | 查询订单（按 `user_id`/`kind`/`status` 过滤） | 200 |
 | GET | `/billing/orders/{orderNo}` | 订单详情 | 200 |
-| POST | `/billing/orders/{orderNo}/renew` | 续费（`days` 1..1095） | 200 |
+| POST | `/billing/orders/{orderNo}/renew` | 续费（传 `cycle`，**不传天数**；金额服务端算） | 200 |
 | POST | `/billing/orders/{orderNo}/refund` | 退款（支持部分退款） | 200 |
 
 ### 节点（nodes）
@@ -249,39 +249,57 @@ curl -b jar.txt https://panel.example.com/v2/billing/plans
 
 ### 创建实例（下单 + 扣款 + 下发）
 
+> **注意**：本接口**没有 `days` 字段**。客户端只传 `cycle`（计费周期），服务期天数与实收金额由服务端推导。原因见 §3.11.1。
+
 ```bash
 curl -X POST https://panel.example.com/v2/instances \
   -H "Authorization: Bearer $EYVES_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "plan_id": 7,
+    "cycle": "monthly",
     "image": "debian/13",
     "label": "web-01",
-    "days": 30,
     "ref": "WHMCS-INV-20260924-001",
     "node_id": 0
   }'
 ```
 
+响应是 `{instance, order}` 两层 —— **额外交回 `order` 是为了让客户端拿到服务端算出的 `order.money.amount`**：
+
 ```json
 {
-  "id": 1042,
-  "name": "vm-1042",
-  "label": "web-01",
-  "user_id": 42,
-  "node_id": 3,
-  "plan_id": 7,
-  "hypervisor": "incus",
-  "instance_type": "container",
-  "image": "debian/13",
-  "cpu": 2,
-  "memory_mb": 2048,
-  "disk_gb": 20,
-  "status": "provisioning",
-  "ipv4": null,
-  "ipv6": "2001:db8:1:2::1042",
-  "expires_at": 1761436800,
-  "created_at": 1758672000
+  "instance": {
+    "id": 1042,
+    "name": "vm-1042",
+    "label": "web-01",
+    "user_id": 42,
+    "node_id": 3,
+    "plan_id": 7,
+    "hypervisor": "incus",
+    "instance_type": "container",
+    "image": "debian/13",
+    "cpu": 2,
+    "memory_mb": 2048,
+    "disk_gb": 20,
+    "status": "provisioning",
+    "ipv4": null,
+    "ipv6": "2001:db8:1:2::1042",
+    "expires_at": 1761436800,
+    "created_at": 1758672000
+  },
+  "order": {
+    "order_no": "ORD-20260924-001",
+    "user_id": 42,
+    "kind": "purchase",
+    "plan_id": 7,
+    "instance_id": 1042,
+    "money": { "amount": { "amount_cents": 1250, "currency": "CNY" },
+               "refunded": { "amount_cents": 0, "currency": "CNY" } },
+    "status": "provisioned",
+    "created_at": 1758672000,
+    "paid_at": 1758672000
+  }
 }
 ```
 
@@ -291,6 +309,7 @@ curl -X POST https://panel.example.com/v2/instances \
 |---|---|
 | 余额不足 | `402` + `EYVES-201`，`details` 含 `required_cents` / `balance_cents` |
 | `ref` 重复 | `409` + `EYVES-202`，**不重复扣款** |
+| `cycle` 未在该套餐定价 | `422` + `EYVES-402`，`details.available_cycles` 列出可选周期 |
 | 扣款成功但下发失败 | 自动全额退款，返回 `EYVES-401`；订单进入 `failed` 且 `refunded == amount` |
 | `node_id=0` | 自动调度到可用节点（排除 `maintenance=true` 与已满节点） |
 
@@ -547,20 +566,77 @@ curl -X PUT .../v2/networks/rdns \
 
 ## 3.11 计费示例
 
+### 3.11.1 定价模型（先读这一节）
+
+**定价由服务端裁决，客户端只选周期。**
+
+```
+客户端                                服务端
+  │  POST /v2/instances                │
+  │  { plan_id: 7, cycle: "yearly" }   │
+  ├───────────────────────────────────▶│
+  │                                    │  ① 查 catalog.PriceOf(plan=7, cycle=yearly)
+  │                                    │     未定价 → 422 + EYVES-402
+  │                                    │  ② 天数由周期推导（yearly = 365 天）
+  │                                    │  ③ 金额 = prices[yearly].price
+  │                                    │  ④ 扣款 + 建单
+  │  { instance: {...},                │
+  │    order: { money: { amount } } }  │
+  │◀───────────────────────────────────┤
+  │  ↑ 前端只展示 order.money.amount，   │
+  │    不自行推算金额与天数              │
+```
+
+**套餐定价的形态**（`GET /v2/billing/plans`）：
+
+```json
+{
+  "id": 7,
+  "name": "标准型 CX21",
+  "cpu": 2,
+  "memory_mb": 2048,
+  "disk_gb": 20,
+  "instance_type": "container",
+  "prices": [
+    { "cycle": "monthly",   "price": { "amount_cents": 1250,  "currency": "CNY" }, "days": 30,  "purchasable": true },
+    { "cycle": "quarterly", "price": { "amount_cents": 3500,  "currency": "CNY" }, "days": 90,  "purchasable": true },
+    { "cycle": "yearly",    "price": { "amount_cents": 12500, "currency": "CNY" }, "days": 365, "purchasable": true }
+  ],
+  "image_ids": [12, 13, 15]
+}
+```
+
+| 规则 | 说明 |
+|---|---|
+| 客户端能选什么 | **只能从 `prices[]` 里已有的 `cycle` 里选**，不能自由指定天数 |
+| 天数谁定 | 服务端。`monthly=30` / `quarterly=90` / `yearly=365`，体现在 `PlanPrice.days` 里仅供展示 |
+| 折扣怎么表达 | 直接用该周期的价格，不是「月付 × 12」。年付折扣就是 `prices[yearly].price < prices[monthly].price × 12` |
+| 未定价的周期 | `purchasable: false` 或干脆不出现 → 下单返回 `422` + `EYVES-402` |
+| 开通费 | 可选的 `setup` 字段，一次性收取 |
+| 币种 | `Money.currency` 固化在价格里，**不允许客户端指定币种** |
+
+> 旧库 `plans` 只有单一 `price_cents`（单周期单币种），迁移到多周期多币种是 `0002` 迁移的内容，尚未编写，见 [04-migration.md §4.1](04-migration.md) 与 [05-risks.md R1-1](05-risks.md)。
+
+### 3.11.2 调用示例
+
 ```bash
 # 查询余额
 curl -H "Authorization: Bearer $EYVES_TOKEN" \
      .../v2/billing/accounts/42/balance
 # => {"user_id":42,"email":"u@example.com","balance":{"amount_cents":5000,"currency":"CNY"}}
 
+# 列出套餐（含各周期定价）
+curl -H "Authorization: Bearer $EYVES_TOKEN" .../v2/billing/plans
+
 # 服务端到服务端充值（幂等）
 curl -X POST .../v2/billing/recharges \
   -d '{"email":"u@example.com","amount_cents":5000,"ref":"EPAY-202609240001","note":"支付宝"}'
 # => {"ok":true,"user_id":42,"balance_cents":5000,"duplicated":false}
 
-# 续费 30 天
+# 续费一个季度（同样只传 cycle，不传天数）
 curl -X POST .../v2/billing/orders/ORD-20260924-001/renew \
-  -d '{"days":30,"ref":"RENEW-20261024-001"}'
+  -d '{"cycle":"quarterly","ref":"RENEW-20261024-001"}'
+# => 响应 Order，金额在 money.amount 里
 
 # 部分退款
 curl -X POST .../v2/billing/orders/ORD-20260924-001/refund \
@@ -659,7 +735,7 @@ curl -X POST .../v2/nodes/3/migrations \
 |---|---|---|---|
 | A1 | `EYVES-203` 语义为"账户不存在"，却被复用为 `401 未认证` | 调用方无法区分「未登录」与「账号被删」 | 新增 `EYVES-204` 专表未认证 |
 | A2 | `EYVES-104` / `105` 已在代码登记，但 openapi 的 responses 未引用 | 文档与实现不完全对齐 | 在 `Unprocessable` 响应的 description 中补上 |
-| A3 | 43 个操作**全部缺少 `operationId`** | 无法自动生成 SDK / 客户端代码 | 按 `listInstances` / `createInstance` 风格补齐 |
+| A3 | ~~43 个操作**全部缺少 `operationId`**~~ | ~~无法自动生成 SDK / 客户端代码~~ | ✅ **已修复**：43/43 补齐，命名约定 `资源.动作` 全小写（`instances.create` / `orders.refund`），实测缺失 0、重复 0。注意部分代码生成器会把 `.` 转为 `_` |
 | A4 | 多个端点无 `security` 覆盖差异声明（如 `/billing/recharges` 应仅允许 `apiKey`） | 权限边界模糊 | 按端点显式声明 `security` |
 | A5 | `Operation.status` 是字符串枚举，无对应轮询端点定义 | 异步操作无法查询进度 | 增加 `GET /v2/operations/{operationId}` |
 | A6 | 未定义限流响应（`429`）与 `Retry-After` | 客户端无退避依据 | 增加 `429` 响应与限流头 |
@@ -667,3 +743,6 @@ curl -X POST .../v2/nodes/3/migrations \
 | A8 | `PUT /images/{id}/content` 的 `Content-Range` 语义依赖 RFC 7233，但未声明 `Accept-Ranges` / `416 Range Not Satisfiable` | 客户端无法判断服务端是否支持断点续传，区间越界行为未定义 | 补 `416` 响应与 `Accept-Ranges: bytes` 声明 |
 | A9 | 镜像分发是异步作业，但 `ImageJob.operation_id` 指向的查询端点未定义（同 A5） | 无法跟踪预热进度 | 与 A5 一并解决 |
 | A10 | `source.type=upload` 的登记未声明所需 `Content-Length` 上限协商机制 | 客户端只能事后被拒（`EYVES-708`），无法预检 | 在 `CreateImageRequest` 增加可选 `total_bytes`，超限时登记阶段即拒绝 |
+| A11 | ~~**价格漏洞**：`CreateInstanceRequest.days` 与 `RenewRequest.days` 由客户端传（1..1095），而 `Plan.price` 是固定值，两者无任何关联~~ | ~~前端按 spec 渲染会出现「拉满 1095 天、价格纹丝不动」；后端若照此实现，可被直接薅穿~~ | ✅ **已修复**：移除两处 `days`，改为必填 `cycle`（`monthly`/`quarterly`/`yearly`），天数与金额全部由服务端推导；`Plan.price` + `duration_days` 合并为 `prices[]`；创建实例响应改为 `{instance, order}` 以回传实收金额 |
+| A12 | `EYVES-402` 常量 `CodeInvalidRequest` 的 Go 注释仍写「领域层入参缺失」，但已被扩展用于「对当前资源无效」（周期未定价） | 代码注释与 API 语义不一致 | 更新 [errors.go](../internal/billing/errors.go) 中 `CodeInvalidRequest` 的注释为「领域层入参缺失或对当前资源无效」；**本轮未改代码（计费域已冻结）** |
+| A13 | `prices[]` 未声明「同一 `cycle` + `currency` 唯一」约束，也未定义多币种时的默认币种选择规则 | 客户端可能拿到同周期多币种却不知该展示哪个 | 在 `PlanPrice` 增加 `(cycle, currency)` 唯一性说明；`GET /plans` 增加必填 `currency` 参数或明确默认币种来源 |

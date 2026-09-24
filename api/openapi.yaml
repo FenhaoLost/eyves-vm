@@ -35,6 +35,7 @@ security:
 paths:
   /instances:
     get:
+      operationId: instances.list
       tags: [instances]
       summary: 列出实例
       parameters:
@@ -60,11 +61,19 @@ paths:
                   total: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
     post:
+      operationId: instances.create
       tags: [instances]
       summary: 创建实例（下单 + 扣款 + 下发）
       description: |
-        等价于旧 `POST /app/deploy`。扣款成功后下发失败会**自动全额退款**并返回
-        `EYVES-401`。请求可携带 `ref` 作为幂等键，重复请求返回既有订单。
+        等价于旧 `POST /app/deploy`，但**定价方式改为服务端裁决**：
+
+          - 客户端传 `cycle`（计费周期），**不传天数**；服务期时长由服务端按周期推导；
+          - `cycle` 必须命中该套餐 `prices` 中已定价的周期，否则 `422` + `EYVES-402`；
+          - 实收金额由服务端计算，经响应 `order.money.amount` 回传 ——
+            **前端不得自行推算金额，也不得自行计算服务期天数**。
+
+        扣款成功后下发失败会**自动全额退款**并返回 `EYVES-401`。
+        请求可携带 `ref` 作为幂等键，重复请求返回既有订单。
       requestBody:
         required: true
         content:
@@ -72,18 +81,20 @@ paths:
             schema: { $ref: '#/components/schemas/CreateInstanceRequest' }
       responses:
         '201':
-          description: 已创建
+          description: 已创建；同时回传承载实收金额的订单
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Instance' }
+              schema: { $ref: '#/components/schemas/CreateInstanceResult' }
         '402': { $ref: '#/components/responses/InsufficientBalance' }
         '409': { $ref: '#/components/responses/DuplicateRef' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
   /instances/{id}:
     parameters:
       - $ref: '#/components/parameters/InstanceId'
     get:
+      operationId: instances.get
       tags: [instances]
       summary: 实例详情
       responses:
@@ -94,6 +105,7 @@ paths:
               schema: { $ref: '#/components/schemas/Instance' }
         '404': { $ref: '#/components/responses/NotFound' }
     delete:
+      operationId: instances.delete
       tags: [instances]
       summary: 删除实例
       parameters:
@@ -108,6 +120,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/InstanceId'
     post:
+      operationId: instances.action
       tags: [instances]
       summary: 电源操作（start / stop / restart）
       requestBody:
@@ -134,6 +147,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/InstanceId'
     post:
+      operationId: instances.reinstall
       tags: [instances]
       summary: 重装系统
       requestBody:
@@ -157,6 +171,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/InstanceId'
     post:
+      operationId: instances.enterRescue
       tags: [instances]
       summary: 进入救援模式（挂载救援 ISO，仅 KVM）
       requestBody:
@@ -175,6 +190,7 @@ paths:
               schema: { $ref: '#/components/schemas/Operation' }
         '403': { $ref: '#/components/responses/Forbidden' }
     delete:
+      operationId: instances.exitRescue
       tags: [instances]
       summary: 退出救援模式
       responses:
@@ -184,6 +200,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/InstanceId'
     get:
+      operationId: snapshots.list
       tags: [snapshots]
       summary: 列出快照
       responses:
@@ -195,6 +212,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/Snapshot' }
     post:
+      operationId: snapshots.create
       tags: [snapshots]
       summary: 创建快照
       requestBody:
@@ -224,6 +242,7 @@ paths:
         required: true
         schema: { type: string }
     delete:
+      operationId: snapshots.delete
       tags: [snapshots]
       summary: 删除快照
       responses:
@@ -237,6 +256,7 @@ paths:
         required: true
         schema: { type: string }
     post:
+      operationId: snapshots.restore
       tags: [snapshots]
       summary: 从快照还原
       responses:
@@ -250,6 +270,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/InstanceId'
     get:
+      operationId: backups.list
       tags: [backups]
       summary: 列出备份
       responses:
@@ -261,6 +282,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/Backup' }
     post:
+      operationId: backups.create
       tags: [backups]
       summary: 创建备份
       requestBody:
@@ -282,6 +304,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/InstanceId'
     get:
+      operationId: backupSchedules.list
       tags: [backups]
       summary: 列出定时备份任务
       responses:
@@ -293,6 +316,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/BackupSchedule' }
     post:
+      operationId: backupSchedules.create
       tags: [backups]
       summary: 创建定时备份任务
       requestBody:
@@ -309,6 +333,7 @@ paths:
 
   /images:
     get:
+      operationId: images.list
       tags: [images]
       summary: 列出镜像
       parameters:
@@ -347,6 +372,7 @@ paths:
                   total: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
     post:
+      operationId: images.register
       tags: [images]
       summary: 登记镜像（三种来源同一入口）
       description: |
@@ -377,6 +403,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/ImageId'
     get:
+      operationId: images.get
       tags: [images]
       summary: 镜像详情（含各形态产物与各节点分发状态）
       responses:
@@ -387,6 +414,7 @@ paths:
               schema: { $ref: '#/components/schemas/Image' }
         '404': { $ref: '#/components/responses/NotFound' }
     delete:
+      operationId: images.delete
       tags: [images]
       summary: 删除镜像
       description: |
@@ -406,6 +434,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/ImageId'
     put:
+      operationId: images.uploadContent
       tags: [images]
       summary: 分片上传产物（仅 source.type=upload）
       description: |
@@ -444,6 +473,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/ImageId'
     post:
+      operationId: images.distribute
       tags: [images]
       summary: 分发 / 预热到节点
       description: |
@@ -486,6 +516,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/ImageId'
     post:
+      operationId: images.refresh
       tags: [images]
       summary: 检查上游更新
       description: |
@@ -518,6 +549,7 @@ paths:
 
   /networks/ipv6/subnets:
     get:
+      operationId: ipv6Subnets.list
       tags: [networks]
       summary: 列出已分配的 IPv6 子网
       parameters:
@@ -533,6 +565,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/IPv6Subnet' }
     post:
+      operationId: ipv6Subnets.allocate
       tags: [networks]
       summary: 从节点池分配一个 IPv6 子网
       requestBody:
@@ -563,6 +596,7 @@ paths:
         required: true
         schema: { type: integer, format: int64 }
     delete:
+      operationId: ipv6Subnets.release
       tags: [networks]
       summary: 释放 IPv6 子网
       responses:
@@ -571,6 +605,7 @@ paths:
 
   /networks/rdns:
     get:
+      operationId: rdns.get
       tags: [networks]
       summary: 查询反向 DNS（PTR）记录
       parameters:
@@ -586,6 +621,7 @@ paths:
               schema: { $ref: '#/components/schemas/PTRRecord' }
         '404': { $ref: '#/components/responses/NotFound' }
     put:
+      operationId: rdns.set
       tags: [networks]
       summary: 设置反向 DNS（PTR）记录
       requestBody:
@@ -601,6 +637,7 @@ paths:
               schema: { $ref: '#/components/schemas/PTRRecord' }
         '422': { $ref: '#/components/responses/Unprocessable' }
     delete:
+      operationId: rdns.delete
       tags: [networks]
       summary: 删除反向 DNS 记录
       parameters:
@@ -613,6 +650,7 @@ paths:
 
   /billing/plans:
     get:
+      operationId: plans.list
       tags: [billing]
       summary: 列出可用套餐（含定价）
       parameters:
@@ -635,6 +673,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/UserId'
     get:
+      operationId: accounts.getBalance
       tags: [billing]
       summary: 查询账户余额
       responses:
@@ -649,6 +688,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/UserId'
     get:
+      operationId: accounts.listTransactions
       tags: [billing]
       summary: 查询账户流水
       parameters:
@@ -669,6 +709,7 @@ paths:
 
   /billing/recharges:
     post:
+      operationId: recharges.create
       tags: [billing]
       summary: 充值入账（服务端到服务端，幂等）
       description: |
@@ -699,6 +740,7 @@ paths:
 
   /billing/orders:
     get:
+      operationId: orders.list
       tags: [billing]
       summary: 查询订单
       parameters:
@@ -733,6 +775,7 @@ paths:
         required: true
         schema: { type: string }
     get:
+      operationId: orders.get
       tags: [billing]
       summary: 查询订单详情
       responses:
@@ -750,18 +793,18 @@ paths:
         required: true
         schema: { type: string }
     post:
+      operationId: orders.renew
       tags: [billing]
-      summary: 续费（按天延长到期时间并从余额扣款）
+      summary: 续费（按计费周期延长到期时间并从余额扣款）
+      description: |
+        与创建实例同一套定价裁决：客户端传 `cycle`，**不传天数**；
+        必须命中该套餐 `prices` 中已定价的周期，否则 `422` + `EYVES-402`。
+        延长天数与实收金额均由服务端计算，金额经响应的 `money.amount` 回传。
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [days]
-              properties:
-                days: { type: integer, minimum: 1, maximum: 1095 }
-                ref: { type: string, description: 幂等键 }
+            schema: { $ref: '#/components/schemas/RenewRequest' }
       responses:
         '200':
           description: 续费成功
@@ -769,6 +812,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Order' }
         '402': { $ref: '#/components/responses/InsufficientBalance' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
   /billing/orders/{orderNo}/refund:
     parameters:
@@ -777,6 +821,7 @@ paths:
         required: true
         schema: { type: string }
     post:
+      operationId: orders.refund
       tags: [billing]
       summary: 退款（支持部分退款）
       requestBody:
@@ -803,6 +848,7 @@ paths:
 
   /nodes:
     get:
+      operationId: nodes.list
       tags: [nodes]
       summary: 列出节点
       responses:
@@ -814,6 +860,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/Node' }
     post:
+      operationId: nodes.create
       tags: [nodes]
       summary: 添加节点
       requestBody:
@@ -832,6 +879,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/NodeId'
     delete:
+      operationId: nodes.delete
       tags: [nodes]
       summary: 移除节点
       responses:
@@ -846,6 +894,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/NodeId'
     get:
+      operationId: nodes.health
       tags: [nodes]
       summary: 节点健康检查（转发被控 /v1/health）
       responses:
@@ -859,6 +908,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/NodeId'
     put:
+      operationId: nodes.setMaintenance
       tags: [nodes]
       summary: 切换维护模式（维护模式下不参与新建调度）
       requestBody:
@@ -878,6 +928,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/NodeId'
     post:
+      operationId: nodes.migrate
       tags: [nodes]
       summary: 发起跨节点迁移
       requestBody:
@@ -943,7 +994,10 @@ components:
 
   responses:
     BadRequest:
-      description: 参数错误（EYVES-101 / EYVES-402）
+      description: |
+        参数错误（EYVES-101 / EYVES-402）。
+
+        创建实例与续费时，若 `cycle` 未在该套餐 `prices` 中定价，返回 `EYVES-402`。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -1021,6 +1075,40 @@ components:
         amount: { $ref: '#/components/schemas/Money' }
         refunded: { $ref: '#/components/schemas/Money' }
 
+    Cycle:
+      type: string
+      enum: [hourly, monthly, quarterly, yearly]
+      description: |
+        计费周期。与 `internal/catalog.Cycle` 一一对应（见 02-architecture.md §2.3.4）。
+
+        服务期天数由服务端按周期推导（monthly=30 / quarterly=90 / yearly=365），
+        客户端**只选周期，不传天数**。这是定价正确性的结构性约束：
+        若允许客户端传任意 `days` 而价格是套餐上的固定值，就会出现
+        「拉满 1095 天却只付 30 天的钱」。
+
+    PlanPrice:
+      type: object
+      required: [cycle, price]
+      description: 一个「周期 × 币种」的定价。对应 `internal/catalog.Price`。
+      properties:
+        cycle:
+          $ref: '#/components/schemas/Cycle'
+        price:
+          $ref: '#/components/schemas/Money'
+        setup:
+          $ref: '#/components/schemas/Money'
+          description: 一次性开通费；缺省或 0 表示不收取
+        days:
+          type: integer
+          description: 该周期对应的服务天数，由服务端定义，供前端展示用
+          example: 30
+        purchasable:
+          type: boolean
+          description: "`price.amount_cents > 0`；为 false 时该周期不可下单但保留展示"
+        partner_ratio_bp:
+          type: integer
+          description: 代理商分成比例（基点，万分之一）；0 表示跟随全局默认
+
     InstanceStatus:
       type: string
       enum: [provisioning, running, stopped, suspended, expired, overquota, error]
@@ -1048,14 +1136,39 @@ components:
 
     CreateInstanceRequest:
       type: object
-      required: [plan_id]
+      required: [plan_id, cycle]
       properties:
         plan_id: { type: integer, format: int64 }
+        cycle:
+          $ref: '#/components/schemas/Cycle'
         image: { type: string }
         label: { type: string, maxLength: 32 }
-        days: { type: integer, minimum: 1, default: 30 }
         ref: { type: string, description: 幂等键（上游账单号）}
         node_id: { type: integer, format: int64, description: 0 表示自动调度 }
+      description: |
+        **无 `days` 字段**。服务期天数由服务端从 `cycle` 推导，
+        客户端不得指定任意天数 —— 这是防「拉满 1095 天却只付 30 天的钱」的结构性约束。
+
+    CreateInstanceResult:
+      type: object
+      required: [instance, order]
+      description: |
+        创建实例的结果。额外交回 `order` 是为了让客户端拿到服务端计算的
+        `order.money.amount` —— 前端只负责展示，**不得自行推算金额**。
+      properties:
+        instance: { $ref: '#/components/schemas/Instance' }
+        order: { $ref: '#/components/schemas/Order' }
+
+    RenewRequest:
+      type: object
+      required: [cycle]
+      description: |
+        **无 `days` 字段**。续费时长与金额均由服务端按 `cycle` 从套餐定价推导。
+        `cycle` 未在该套餐 `prices` 中定价时返回 `422` + `EYVES-402`。
+      properties:
+        cycle:
+          $ref: '#/components/schemas/Cycle'
+        ref: { type: string, description: 幂等键 }
 
     Operation:
       type: object
@@ -1264,10 +1377,16 @@ components:
         cpu: { type: integer }
         memory_mb: { type: integer }
         disk_gb: { type: integer }
-        price: { $ref: '#/components/schemas/Money' }
-        duration_days: { type: integer }
         instance_type: { type: string, enum: [container, vm] }
-        purchasable: { type: boolean, description: "price.amount_cents > 0" }
+        prices:
+          type: array
+          description: |
+            该套餐**已定价的周期**。客户端只能从这些周期里选，不能自由指定天数。
+            对应 `internal/catalog.Plan.Prices`（多周期多币种，旧库 plans 只有单一
+            `price_cents`，无法做年付折扣 —— 见 05-risks.md R1-1）。
+
+            空数组表示该套餐未定价，不可下单。
+          items: { $ref: '#/components/schemas/PlanPrice' }
         image_ids:
           type: array
           description: |
